@@ -328,7 +328,7 @@ fn version_order(name: &str) -> (Vec<u64>, String) {
 /// Browser installer that downloads Chrome for Testing from Google's CDN.
 pub struct BrowserInstaller {
   cache_dir: PathBuf,
-  client: Client,
+  client: std::sync::OnceLock<Client>,
   download_hosts: Vec<String>,
 }
 
@@ -392,9 +392,22 @@ impl BrowserInstaller {
   pub fn with_cache_dir(cache_dir: PathBuf) -> Self {
     Self {
       cache_dir,
-      client: Client::new(),
+      client: std::sync::OnceLock::new(),
       download_hosts: PW_CDN_MIRRORS.iter().map(|host| (*host).to_string()).collect(),
     }
+  }
+
+  /// The HTTP client, built on first use. Building it loads the system's CA
+  /// certificates, which a bare image only gains from
+  /// [`Self::install_system_deps`], so it waits until a download needs it.
+  fn client(&self) -> Result<&Client> {
+    if let Some(client) = self.client.get() {
+      return Ok(client);
+    }
+    let built = Client::builder()
+      .build()
+      .map_err(|e| backend_err(format!("no HTTP client for downloads: {e}")))?;
+    Ok(self.client.get_or_init(|| built))
   }
 
   /// Download Playwright's builds from `hosts`, tried in order, instead of
@@ -475,7 +488,7 @@ impl BrowserInstaller {
 
     // Fetch the latest stable version info
     let cft: CftResponse = self
-      .client
+      .client()?
       .get(CFT_VERSIONS_URL)
       .send()
       .await
@@ -663,7 +676,7 @@ impl BrowserInstaller {
     F: Fn(InstallProgress),
   {
     let response = self
-      .client
+      .client()?
       .get(url)
       .send()
       .await
@@ -824,7 +837,7 @@ impl BrowserInstaller {
     progress(InstallProgress::Resolving);
 
     let cft: CftResponse = self
-      .client
+      .client()?
       .get(CFT_VERSIONS_URL)
       .send()
       .await
@@ -1110,7 +1123,7 @@ impl BrowserInstaller {
 
     // Fetch the latest stable Firefox version from Mozilla's API
     let versions: std::collections::HashMap<String, String> = self
-      .client
+      .client()?
       .get(FIREFOX_VERSIONS_URL)
       .send()
       .await
@@ -1222,7 +1235,7 @@ impl BrowserInstaller {
 
   async fn released_browsers_json(&self) -> Result<PwBrowsersJson> {
     let release: NpmRelease = self
-      .client
+      .client()?
       .get(PW_LATEST_RELEASE_URL)
       .send()
       .await
@@ -1231,7 +1244,7 @@ impl BrowserInstaller {
       .await
       .map_err(|e| backend_err(format!("failed to parse the latest Playwright release: {e}")))?;
     self
-      .client
+      .client()?
       .get(released_browsers_json_url(&release)?)
       .send()
       .await
@@ -2479,6 +2492,15 @@ mod webkit_revision_tests {
       failed.to_string().contains("no download host is configured"),
       "{failed}"
     );
+  }
+
+  #[test]
+  fn an_installer_builds_its_client_only_when_a_download_needs_it() {
+    let installer = BrowserInstaller::with_cache_dir(PathBuf::from("/cache"));
+    assert!(installer.client.get().is_none());
+    let first: *const reqwest::Client = installer.client().expect("client");
+    let second: *const reqwest::Client = installer.client().expect("client");
+    assert!(std::ptr::eq(first, second));
   }
 
   #[test]
