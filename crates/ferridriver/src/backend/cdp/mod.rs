@@ -35,6 +35,7 @@ use crate::network::{
   self, BodyFn, HeaderEntry, Headers, RawHeadersFn, RemoteAddr, RequestInit, RequestSizes, RequestTiming, Response,
   ResponseInit, SecurityDetails, WebSocket,
 };
+use crate::operation_budget::OperationBudget;
 use ferridriver_types::keyboard::KeyStroke;
 use rustc_hash::FxHashMap;
 use std::time::Duration;
@@ -2999,7 +3000,7 @@ impl<T: CdpWrap> CdpPage<T> {
   /// "navigate-returns-with-whatever-we-have" semantics on hostile
   /// pages; the caller's response wait surfaces real failures.
   async fn await_loader_lifecycle(&self, expected_loader_id: &str, target_event: &str, timeout_ms: u64) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let budget = OperationBudget::new(timeout_ms)?;
     loop {
       let notified = self.lifecycle_notify.notified();
       tokio::pin!(notified);
@@ -3018,7 +3019,7 @@ impl<T: CdpWrap> CdpPage<T> {
           return Ok(());
         }
       }
-      if tokio::time::timeout_at(deadline, notified).await.is_err() {
+      if budget.wait(notified).await.is_err() {
         return Ok(());
       }
     }
@@ -3030,7 +3031,7 @@ impl<T: CdpWrap> CdpPage<T> {
   /// Waits for the main frame's `current_loader_id` to change away
   /// from `pre_loader_id` AND fire `target_event` for the new loader.
   async fn await_loader_change(&self, pre_loader_id: &str, target_event: &str, timeout_ms: u64) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let budget = OperationBudget::new(timeout_ms)?;
     loop {
       let notified = self.lifecycle_notify.notified();
       tokio::pin!(notified);
@@ -3047,7 +3048,7 @@ impl<T: CdpWrap> CdpPage<T> {
           return Ok(());
         }
       }
-      if tokio::time::timeout_at(deadline, notified).await.is_err() {
+      if budget.wait(notified).await.is_err() {
         return Ok(());
       }
     }
@@ -3066,7 +3067,7 @@ impl<T: CdpWrap> CdpPage<T> {
     target_event: &str,
     timeout_ms: u64,
   ) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let budget = OperationBudget::new(timeout_ms)?;
     let main_frame = self.peek_main_frame_id();
     loop {
       let notified = self.lifecycle_notify.notified();
@@ -3090,7 +3091,7 @@ impl<T: CdpWrap> CdpPage<T> {
           return Ok(true);
         }
       }
-      if tokio::time::timeout_at(deadline, notified).await.is_err() {
+      if budget.wait(notified).await.is_err() {
         return Ok(false);
       }
     }

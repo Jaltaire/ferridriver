@@ -25,6 +25,7 @@ use crate::console_message::ConsoleMessage;
 use crate::error::{FerriError, Result};
 use crate::events::EventEmitter;
 use crate::network::{Request as NetworkRequest, Response};
+use crate::operation_budget::OperationBudget;
 use crate::state::DialogEvent;
 use ferridriver_types::keyboard::KeyStroke;
 
@@ -1202,15 +1203,18 @@ impl WebKitPage {
       frame_id: None,
       referrer: referrer.map(str::to_string),
     };
-    let nav = tokio::time::timeout(
-      std::time::Duration::from_millis(timeout_ms),
-      self
-        .browser
-        .send(protocol::PLAYWRIGHT_NAVIGATE, serde_json::to_value(&params)?),
-    )
-    .await
-    .map_err(|_| FerriError::timeout(format!("navigating to {url}"), timeout_ms))?
-    .map_err(conn_err)?;
+    let budget = OperationBudget::new(timeout_ms)?;
+    let nav = budget
+      .scope(
+        budget.wait(
+          self
+            .browser
+            .send(protocol::PLAYWRIGHT_NAVIGATE, serde_json::to_value(&params)?),
+        ),
+      )
+      .await
+      .map_err(|_| FerriError::timeout(format!("navigating to {url}"), timeout_ms))?
+      .map_err(conn_err)?;
     let parsed: NavigateResult = serde_json::from_value(nav).unwrap_or_default();
     if let Some(err) = parsed.error_text
       && !err.is_empty()
@@ -1252,25 +1256,26 @@ impl WebKitPage {
   async fn wait_for_lifecycle(&self, lifecycle: NavLifecycle, timeout_ms: u64, loader_id: Option<&str>) -> Result<()> {
     let signals = Arc::clone(&self.lifecycle);
     let nav_slot = self.nav_request_slot.clone();
-    let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async move {
-      loop {
-        let notified = signals.notify.notified();
-        if signals.seen(lifecycle) && signals.committed(loader_id) {
-          return Ok(());
+    let result = OperationBudget::new(timeout_ms)?
+      .wait(async move {
+        loop {
+          let notified = signals.notify.notified();
+          if signals.seen(lifecycle) && signals.committed(loader_id) {
+            return Ok(());
+          }
+          if let Some(err) = signals.provisional_failure(loader_id) {
+            return Err(FerriError::backend(format!("webkit navigate: {err}")));
+          }
+          if let Some((event_request_id, err)) = signals.failure()
+            && let Some(req) = nav_slot.get_for(loader_id)
+            && event_request_id == req.id()
+          {
+            return Err(FerriError::backend(format!("webkit navigate: {err}")));
+          }
+          notified.await;
         }
-        if let Some(err) = signals.provisional_failure(loader_id) {
-          return Err(FerriError::backend(format!("webkit navigate: {err}")));
-        }
-        if let Some((event_request_id, err)) = signals.failure()
-          && let Some(req) = nav_slot.get_for(loader_id)
-          && event_request_id == req.id()
-        {
-          return Err(FerriError::backend(format!("webkit navigate: {err}")));
-        }
-        notified.await;
-      }
-    })
-    .await;
+      })
+      .await;
     match result {
       Ok(inner) => inner,
       // A navigation whose lifecycle never fires is a TimeoutError, not
@@ -1349,28 +1354,29 @@ impl WebKitPage {
   async fn wait_for_history_commit(&self, lifecycle: NavLifecycle, timeout_ms: u64) -> Result<bool> {
     let signals = Arc::clone(&self.lifecycle);
     let nav_slot = self.nav_request_slot.clone();
-    let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async move {
-      loop {
-        let notified = signals.notify.notified();
-        if signals.seen(lifecycle) {
-          return Ok(false);
+    let result = OperationBudget::new(timeout_ms)?
+      .wait(async move {
+        loop {
+          let notified = signals.notify.notified();
+          if signals.seen(lifecycle) {
+            return Ok(false);
+          }
+          if signals.same_document.load(Ordering::SeqCst) && !signals.seen(NavLifecycle::Commit) {
+            return Ok(true);
+          }
+          if let Some(err) = signals.provisional_failure(None) {
+            return Err(FerriError::backend(format!("webkit navigate: {err}")));
+          }
+          if let Some((event_request_id, err)) = signals.failure()
+            && let Some(req) = nav_slot.get_for(None)
+            && event_request_id == req.id()
+          {
+            return Err(FerriError::backend(format!("webkit navigate: {err}")));
+          }
+          notified.await;
         }
-        if signals.same_document.load(Ordering::SeqCst) && !signals.seen(NavLifecycle::Commit) {
-          return Ok(true);
-        }
-        if let Some(err) = signals.provisional_failure(None) {
-          return Err(FerriError::backend(format!("webkit navigate: {err}")));
-        }
-        if let Some((event_request_id, err)) = signals.failure()
-          && let Some(req) = nav_slot.get_for(None)
-          && event_request_id == req.id()
-        {
-          return Err(FerriError::backend(format!("webkit navigate: {err}")));
-        }
-        notified.await;
-      }
-    })
-    .await;
+      })
+      .await;
     match result {
       Ok(inner) => inner,
       Err(_) => Err(FerriError::timeout(
