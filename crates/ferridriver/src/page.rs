@@ -617,7 +617,9 @@ impl Page {
     &self.inner
   }
 
-  /// Set the default timeout for all operations (milliseconds).
+  /// Set the default timeout for all operations (milliseconds), among
+  /// them `evaluate` and a screenshot given no timeout of its own.
+  /// Passing `0` means "no timeout".
   pub fn set_default_timeout(&self, ms: u64) {
     self.default_timeout.store(ms, Ordering::Relaxed);
   }
@@ -1278,13 +1280,17 @@ impl Page {
     arg: crate::protocol::SerializedArgument,
     is_function: Option<bool>,
   ) -> Result<crate::protocol::SerializedValue> {
-    self
-      .traced(
-        "evaluate",
-        serde_json::json!({ "expression": fn_source }),
-        self.main_frame().evaluate(fn_source, arg.clone(), is_function),
-      )
-      .await
+    let frame = self.main_frame();
+    futures::FutureExt::boxed(async move {
+      self
+        .traced(
+          "evaluate",
+          serde_json::json!({ "expression": fn_source }),
+          frame.evaluate(fn_source, arg, is_function),
+        )
+        .await
+    })
+    .await
   }
 
   /// Typed evaluate: run `fn_source` in the page and deserialize the
@@ -2231,13 +2237,14 @@ impl Page {
   /// `/tmp/playwright/packages/playwright-core/types/types.d.ts:23280`.
   ///
   /// The `screenshotter` module does the capture; this writes `path` and
-  /// bounds the whole of it by `timeout`.
+  /// bounds the whole of it by `timeout`, or by the page's default
+  /// timeout when the options give none. `0` means no timeout.
   ///
   /// # Errors
   ///
   /// Returns [`crate::error::FerriError::Timeout`] if the capture
-  /// exceeds `opts.timeout` milliseconds; otherwise propagates any
-  /// backend-specific failure.
+  /// exceeds that timeout; otherwise propagates any backend-specific
+  /// failure.
   #[track_caller]
   pub fn screenshot(&self) -> crate::action::Action<'_, ScreenshotOptions, Vec<u8>> {
     let page = self;
@@ -2294,19 +2301,12 @@ impl Page {
     if !opts.mask.is_empty() {
       self.inner.ensure_engine_injected().await?;
     }
+    let budget =
+      crate::operation_budget::OperationBudget::operation(opts.timeout.unwrap_or_else(|| self.default_timeout()))?;
     let capture = crate::screenshotter::screenshot_page(self, &opts);
-    let bytes = match opts.timeout {
-      Some(ms) if ms > 0 => {
-        let fut = tokio::time::timeout(std::time::Duration::from_millis(ms), capture);
-        match fut.await {
-          Ok(res) => res?,
-          Err(_) => {
-            return Err(crate::error::FerriError::timeout("screenshot", ms));
-          },
-        }
-      },
-      _ => capture.await?,
-    };
+    let bytes = futures::FutureExt::boxed(budget.scope(budget.wait(capture)))
+      .await
+      .map_err(|expired| expired.error("screenshot"))??;
     if let Some(ref path) = opts.path {
       if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

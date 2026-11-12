@@ -121,20 +121,28 @@ impl Frame {
   /// # Errors
   ///
   /// Returns a [`crate::error::FerriError`] on page-side exception or
-  /// protocol failure.
+  /// protocol failure, and [`crate::error::FerriError::Timeout`] once the
+  /// page's default timeout runs out. A default timeout of `0` waits as
+  /// long as the page takes, as Playwright's `evaluate` does.
   pub async fn evaluate(
     &self,
     fn_source: &str,
     arg: crate::protocol::SerializedArgument,
     is_function: Option<bool>,
   ) -> Result<crate::protocol::SerializedValue> {
+    let budget = crate::operation_budget::OperationBudget::operation(self.page.default_timeout())?;
     self
       .page
       .traced_as(
         "Frame",
         "evaluate",
         serde_json::json!({ "expression": fn_source }),
-        self.evaluate_untraced(fn_source, arg, is_function),
+        futures::FutureExt::boxed(budget.scope(async move {
+          budget
+            .wait(self.evaluate_untraced(fn_source, arg, is_function))
+            .await
+            .map_err(|expired| expired.error("evaluate"))?
+        })),
       )
       .await
   }
