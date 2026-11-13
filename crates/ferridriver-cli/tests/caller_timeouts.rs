@@ -81,6 +81,18 @@ async fn creating_navigating_and_closing_follow_the_callers_timeouts(browser: Br
   unfallen("navigating again", page.goto(&format!("{origin}/next")).into_future()).await?;
   unfallen("going back", page.go_back().into_future()).await?;
   unfallen("going forward", page.go_forward().into_future()).await?;
+  page.set_default_navigation_timeout(0);
+  unfallen(
+    "navigating with no timeout to a document that requests nothing",
+    page.goto("about:blank").into_future(),
+  )
+  .await?;
+  unfallen(
+    "reloading with no timeout a document that requests nothing",
+    page.reload().into_future(),
+  )
+  .await?;
+  page.set_default_navigation_timeout(CALLER_MS);
   unfallen("setting the content", page.set_content(DOCUMENT).into_future()).await?;
   unfallen("reading the storage state", context.storage_state().into_future()).await?;
   unfallen("closing the page", page.close().into_future()).await?;

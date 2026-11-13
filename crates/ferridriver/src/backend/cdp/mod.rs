@@ -2783,7 +2783,7 @@ impl<T: CdpWrap> CdpPage<T> {
     // `Page.navigate` answers with a loaderId only when it created a
     // document; a fragment jump has none and no request to wait for.
     let grace = Self::nav_grace_for(!nav_loader_id.is_empty(), crate::network::document_response_wait());
-    Ok(self.await_nav_response(grace).await)
+    Ok(self.await_nav_response(&nav_loader_id, grace).await)
   }
 
   /// Resolve the main-document `Response` captured by the network
@@ -2796,8 +2796,11 @@ impl<T: CdpWrap> CdpPage<T> {
   /// the lifecycle reach us on separate consumers and the request can be
   /// processed second. A same-document navigation never issues one, so
   /// waiting there would only slow it down.
-  async fn await_nav_response(&self, grace: std::time::Duration) -> Option<Response> {
-    self.nav_request_slot.final_response(grace).await
+  async fn await_nav_response(&self, loader_id: &str, grace: std::time::Duration) -> Option<Response> {
+    self
+      .nav_request_slot
+      .final_response_for((!loader_id.is_empty()).then_some(loader_id), grace)
+      .await
   }
 
   /// The grace a navigation that committed `expected_loader_id` gets;
@@ -2919,11 +2922,9 @@ impl<T: CdpWrap> CdpPage<T> {
     self
       .await_loader_change(&pre_loader_id, target_event, timeout_ms)
       .await?;
-    let grace = Self::nav_grace_for(
-      self.current_loader_id() != pre_loader_id,
-      crate::network::document_response_wait(),
-    );
-    Ok(self.await_nav_response(grace).await)
+    let loader_id = self.current_loader_id();
+    let grace = Self::nav_grace_for(loader_id != pre_loader_id, crate::network::document_response_wait());
+    Ok(self.await_nav_response(&loader_id, grace).await)
   }
 
   pub async fn go_back(&self, lifecycle: crate::backend::NavLifecycle, timeout_ms: u64) -> Result<Option<Response>> {
@@ -2979,11 +2980,9 @@ impl<T: CdpWrap> CdpPage<T> {
     {
       return Ok(None);
     }
-    let grace = Self::nav_grace_for(
-      self.current_loader_id() != pre_loader_id,
-      crate::network::NAV_REQUEST_GRACE,
-    );
-    Ok(self.await_nav_response(grace).await)
+    let loader_id = self.current_loader_id();
+    let grace = Self::nav_grace_for(loader_id != pre_loader_id, crate::network::NAV_REQUEST_GRACE);
+    Ok(self.await_nav_response(&loader_id, grace).await)
   }
 
   /// Wait until the page's main-frame [`LifecycleState`] has both
@@ -6146,7 +6145,9 @@ impl<T: CdpWrap> CdpPage<T> {
     emitter: crate::events::EventEmitter,
     nav_request_slot: crate::network::NavRequestSlot,
   ) -> tokio::task::AbortHandle {
-    let mut rx = transport.tap_event_domains(&["Network"], session_id.as_deref());
+    let mut rx = transport.tap_event_domains(&["Network", "Page"], session_id.as_deref());
+    let commits = nav_request_slot.clone();
+    let main_frame = Arc::clone(&target_id);
     let tracker: Arc<NetworkTracker<T>> = Arc::new(NetworkTracker::new(
       transport,
       session_id.clone(),
@@ -6164,6 +6165,16 @@ impl<T: CdpWrap> CdpPage<T> {
         let method = event.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = event.get("params");
         match method {
+          "Page.frameNavigated" => {
+            let frame = params.and_then(|p| p.get("frame"));
+            if let Some(loader_id) = frame
+              .filter(|f| f.get("id").and_then(|v| v.as_str()) == Some(&*main_frame))
+              .and_then(|f| f.get("loaderId"))
+              .and_then(|v| v.as_str())
+            {
+              commits.commit_loader(loader_id.to_string());
+            }
+          },
           "Network.requestWillBeSent" => {
             if let Some(p) = params {
               tracker.on_request_will_be_sent(p, &network_log, &emitter).await;

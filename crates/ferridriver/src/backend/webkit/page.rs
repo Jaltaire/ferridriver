@@ -466,6 +466,14 @@ impl LifecycleSignals {
     self.mark(NavLifecycle::Commit);
   }
 
+  pub(crate) fn committed_loader(&self) -> Option<String> {
+    self
+      .committed_loader
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .clone()
+  }
+
   /// Whether the document of the navigation under `loader_id` has
   /// committed; any commit counts for a waiter that does not know its loader.
   pub fn committed(&self, loader_id: Option<&str>) -> bool {
@@ -1274,7 +1282,11 @@ impl WebKitPage {
   /// the lifecycle reach us on separate consumers and the request can be
   /// processed second. A same-document navigation issues none.
   async fn await_nav_response(&self, grace: std::time::Duration) -> Option<Response> {
-    self.nav_request_slot.final_response(grace).await
+    let loader_id = self.lifecycle.committed_loader();
+    self
+      .nav_request_slot
+      .final_response_for(loader_id.as_deref(), grace)
+      .await
   }
 
   /// Wait for the target-session lifecycle event matching `lifecycle`,

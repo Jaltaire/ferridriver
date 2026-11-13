@@ -723,8 +723,12 @@ impl NavRequestSlot {
       // Arm before the second look: a `set` racing between the two would
       // otherwise notify nobody and leave this waiting out the timeout.
       notified.as_mut().enable();
+      let settled = loader_id.is_some() && self.committed_loader().as_deref() == loader_id;
       if let Some(request) = self.get_for(loader_id) {
         return Some(request);
+      }
+      if settled {
+        return None;
       }
       let woke = if let Some(deadline) = deadline {
         tokio::time::timeout_at(deadline, notified).await.is_ok()
@@ -736,6 +740,10 @@ impl NavRequestSlot {
         return self.get_for(loader_id);
       }
     }
+  }
+
+  fn committed_loader(&self) -> Option<String> {
+    self.committed.lock().ok().and_then(|guard| guard.clone())
   }
 
   pub fn clear(&self) {
@@ -1427,6 +1435,35 @@ mod tests {
       })
       .await;
     assert_eq!(spent, std::time::Duration::ZERO);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_document_that_commits_with_no_request_is_answered_at_its_commit_and_not_after_its_budget() {
+    let slot = Arc::new(NavRequestSlot::new());
+    let committing = Arc::clone(&slot);
+    let started = tokio::time::Instant::now();
+    let commit = tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+      committing.commit_loader("blank".into());
+    });
+    let found = slot.wait_for(Some("blank"), std::time::Duration::from_secs(600)).await;
+    commit.await.unwrap();
+    assert!(found.is_none());
+    assert_eq!(tokio::time::Instant::now() - started, std::time::Duration::from_secs(5));
+    let other = slot.wait_for(Some("next"), std::time::Duration::from_secs(10)).await;
+    assert!(other.is_none());
+    assert_eq!(
+      tokio::time::Instant::now() - started,
+      std::time::Duration::from_secs(15)
+    );
+    slot.set_for_loader(document_request("next-document"), "next".into());
+    slot.commit_loader("next".into());
+    let requested = slot.wait_for(Some("next"), std::time::Duration::from_secs(600)).await;
+    assert!(requested.is_some());
+    assert_eq!(
+      tokio::time::Instant::now() - started,
+      std::time::Duration::from_secs(15)
+    );
   }
 
   #[tokio::test(start_paused = true)]
