@@ -2391,6 +2391,7 @@ impl BidiPage {
     let exposed_fns = self.exposed_fns.clone();
     let exposed_session = self.session.clone();
     let exposed_ctx = self.context_id.clone();
+    self.nav_request_slot.feed();
     let tracker = Arc::new(BidiNetworkTracker::new(
       self.session.clone(),
       self.context_id.clone(),

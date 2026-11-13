@@ -6146,6 +6146,7 @@ impl<T: CdpWrap> CdpPage<T> {
     nav_request_slot: crate::network::NavRequestSlot,
   ) -> tokio::task::AbortHandle {
     let mut rx = transport.tap_event_domains(&["Network", "Page"], session_id.as_deref());
+    nav_request_slot.feed();
     let commits = nav_request_slot.clone();
     let main_frame = Arc::clone(&target_id);
     let tracker: Arc<NetworkTracker<T>> = Arc::new(NetworkTracker::new(

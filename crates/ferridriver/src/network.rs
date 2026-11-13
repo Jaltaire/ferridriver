@@ -643,6 +643,7 @@ pub struct NavRequestSlot {
   /// page's and is a navigation request too.
   committed: Arc<std::sync::Mutex<Option<String>>>,
   filled: Arc<tokio::sync::Notify>,
+  fed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NavRequestSlot {
@@ -653,6 +654,10 @@ impl NavRequestSlot {
 
   pub fn set(&self, request: Request) {
     self.push(None, request);
+  }
+
+  pub fn feed(&self) {
+    self.fed.store(true, std::sync::atomic::Ordering::Release);
   }
 
   /// [`Self::set`] for a request whose document loader is known. Starting
@@ -715,6 +720,9 @@ impl NavRequestSlot {
   async fn wait_for(&self, loader_id: Option<&str>, timeout: std::time::Duration) -> Option<Request> {
     if let Some(request) = self.get_for(loader_id) {
       return Some(request);
+    }
+    if !self.fed.load(std::sync::atomic::Ordering::Acquire) {
+      return None;
     }
     let deadline = tokio::time::Instant::now().checked_add(timeout);
     loop {
@@ -1438,8 +1446,25 @@ mod tests {
   }
 
   #[tokio::test(start_paused = true)]
+  async fn a_slot_no_listener_feeds_answers_at_once_rather_than_waiting_out_its_budget() {
+    let slot = NavRequestSlot::new();
+    let started = tokio::time::Instant::now();
+    assert!(
+      slot
+        .wait_for(Some("unheard"), std::time::Duration::from_secs(600))
+        .await
+        .is_none()
+    );
+    assert!(slot.final_response(std::time::Duration::MAX).await.is_none());
+    assert_eq!(tokio::time::Instant::now(), started);
+    slot.set(document_request("unfed-document"));
+    assert!(slot.wait_for(None, std::time::Duration::from_secs(600)).await.is_some());
+  }
+
+  #[tokio::test(start_paused = true)]
   async fn a_document_that_commits_with_no_request_is_answered_at_its_commit_and_not_after_its_budget() {
     let slot = Arc::new(NavRequestSlot::new());
+    slot.feed();
     let committing = Arc::clone(&slot);
     let started = tokio::time::Instant::now();
     let commit = tokio::spawn(async move {
@@ -1469,6 +1494,7 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn a_document_request_seen_after_the_old_quarter_second_still_answers_the_navigation() {
     let slot = Arc::new(NavRequestSlot::new());
+    slot.feed();
     let filler = Arc::clone(&slot);
     let late = tokio::spawn(async move {
       tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1484,6 +1510,7 @@ mod tests {
       Some("http://example.test/")
     );
     let unlimited_slot = Arc::new(NavRequestSlot::new());
+    unlimited_slot.feed();
     let filler = Arc::clone(&unlimited_slot);
     let late = tokio::spawn(async move {
       tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
@@ -1500,6 +1527,7 @@ mod tests {
   #[tokio::test]
   async fn navigation_waits_for_redirect_hops_queued_after_the_lifecycle_result() {
     let slot = NavRequestSlot::new();
+    slot.feed();
     let request = |previous: Option<Request>| {
       Request::new(RequestInit {
         id: "reused-bidi-id".into(),
@@ -1567,6 +1595,7 @@ mod tests {
       })
     };
     let slot = NavRequestSlot::new();
+    slot.feed();
     slot.set_for_loader(request("http://example.test/page"), "page".into());
     // The cancelled navigation's request, reported after the new one.
     slot.set_for_loader(request("http://example.test/cancelled"), "cancelled".into());
