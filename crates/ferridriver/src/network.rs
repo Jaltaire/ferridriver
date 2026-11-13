@@ -1449,13 +1449,17 @@ mod tests {
   async fn a_slot_no_listener_feeds_answers_at_once_rather_than_waiting_out_its_budget() {
     let slot = NavRequestSlot::new();
     let started = tokio::time::Instant::now();
-    assert!(
-      slot
-        .wait_for(Some("unheard"), std::time::Duration::from_secs(600))
-        .await
-        .is_none()
-    );
-    assert!(slot.final_response(std::time::Duration::MAX).await.is_none());
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(3_600), async {
+      (
+        slot
+          .wait_for(Some("unheard"), std::time::Duration::from_secs(600))
+          .await
+          .is_none(),
+        slot.final_response(std::time::Duration::MAX).await.is_none(),
+      )
+    })
+    .await;
+    assert_eq!(answered.ok(), Some((true, true)));
     assert_eq!(tokio::time::Instant::now(), started);
     slot.set(document_request("unfed-document"));
     assert!(slot.wait_for(None, std::time::Duration::from_secs(600)).await.is_some());
