@@ -81,9 +81,12 @@ macro_rules! retry_resolve {
     let mut __trace_input_pending = __trace_span.is_some();
     // Last call-log line, to collapse identical retry messages.
     let mut __trace_last_log = ::std::string::String::new();
-    let __result = 'retry: {
-      let __op_name: &str = $op;
-      let __resolved_timeout: u64 = $timeout_ms.unwrap_or_else(|| $self.frame.page_arc().default_timeout());
+    let __op_name: &str = $op;
+    let __resolved_timeout: u64 = $timeout_ms.unwrap_or_else(|| $self.frame.page_arc().default_timeout());
+    let __budget = $crate::operation_budget::OperationBudget::operation(__resolved_timeout);
+    let __result = match __budget {
+      ::std::result::Result::Err(e) => ::std::result::Result::Err(e),
+      ::std::result::Result::Ok(__budget) => ::std::boxed::Box::pin(__budget.scope(async { 'retry: {
       let __deadline: ::std::option::Option<::std::time::Instant> = if __resolved_timeout == 0 {
         ::std::option::Option::None
       } else {
@@ -198,6 +201,12 @@ macro_rules! retry_resolve {
                 __call_log.push(format!("operation was aborted: {e}"));
                 break 'retry ::std::result::Result::Err(e.with_call_log(::std::mem::take(&mut __call_log)));
               },
+              ::std::result::Result::Err(e) if e.is_timeout_error() && __budget.remaining_ms().is_err() => {
+                break 'retry ::std::result::Result::Err(
+                  $crate::error::FerriError::timeout(__op_name.to_string(), __resolved_timeout)
+                    .with_call_log(::std::mem::take(&mut __call_log)),
+                );
+              },
               ::std::result::Result::Err(e) => {
                 let __msg = e.to_string();
                 if $crate::locator::retries(&e) {
@@ -234,6 +243,7 @@ macro_rules! retry_resolve {
           },
         }
       }
+    } })).await,
     };
     if let ::std::option::Option::Some(__s) = __trace_span {
       __trace_page
@@ -1831,6 +1841,10 @@ impl Locator {
     // did not, so a context default reached everything except the two
     // calls named after waiting.
     let timeout = opts.timeout.unwrap_or_else(|| self.frame.page_arc().default_timeout());
+    crate::operation_budget::within_boxed(timeout, self.wait_for_within(opts, timeout)).await
+  }
+
+  async fn wait_for_within(&self, opts: WaitOptions, timeout: u64) -> Result<()> {
     let state = opts.state.unwrap_or_default();
     // Playwright's `timeout: 0` waits for as long as it takes.
     let deadline = (timeout != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout));
@@ -2754,12 +2768,13 @@ impl Locator {
   /// default when `None`, without limit when `0`).
   async fn read(&self, op: &'static str, js_body: &str, timeout: Option<u64>) -> Result<serde_json::Value> {
     let page = self.frame.page_arc();
+    let timeout = timeout.unwrap_or_else(|| page.default_timeout());
     page
       .traced_as(
         "Locator",
         op,
         serde_json::json!({ "selector": self.selector }),
-        self.read_untraced(op, js_body, timeout),
+        crate::operation_budget::within_boxed(timeout, self.read_untraced(op, js_body, Some(timeout))),
       )
       .await
   }

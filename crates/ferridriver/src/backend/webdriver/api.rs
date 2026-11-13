@@ -243,10 +243,10 @@ impl WebDriverPage {
     }
   }
 
-  pub async fn wait_for_navigation(&self) -> Result<()> {
+  pub async fn wait_for_navigation(&self, timeout_ms: u64) -> Result<()> {
     self
       .events
-      .wait_for(|event| matches!(event, crate::events::PageEvent::Load), self.timeout_ms)
+      .wait_for(|event| matches!(event, crate::events::PageEvent::Load), timeout_ms)
       .await?;
     Ok(())
   }

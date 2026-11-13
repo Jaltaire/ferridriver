@@ -170,7 +170,7 @@ impl super::transport::CdpTransport for WsTransport {
     method: &str,
     params: &serde_json::Value,
   ) -> Result<serde_json::Value> {
-    let budget = crate::operation_budget::OperationBudget::current(30_000)?;
+    let budget = self.dispatcher.command_budget(session_id, 30_000)?;
     let (id, mut data, rx) = self.dispatcher.build_command(session_id, method, params)?;
     let mut pending = self.dispatcher.pending_command(id);
     if data.last() == Some(&0) {
@@ -247,6 +247,14 @@ impl super::transport::CdpTransport for WsTransport {
   fn unregister_session(&self, session_id: &str) {
     self.dispatcher.unregister_session(session_id);
   }
+
+  fn register_owner_timeout(&self, session_id: &str, source: crate::operation_budget::TimeoutSource) {
+    self.dispatcher.register_owner_timeout(session_id, source);
+  }
+
+  fn inherit_owner_timeout(&self, from: &str, to: &str) {
+    self.dispatcher.inherit_owner_timeout(from, to);
+  }
 }
 
 async fn discover_ws_url(
@@ -255,12 +263,13 @@ async fn discover_ws_url(
   chromium_path: &str,
   stderr_tail: &crate::backend::process::StderrTail,
 ) -> Result<String> {
-  let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+  let budget = crate::operation_budget::OperationBudget::current(10_000)?;
   loop {
-    if tokio::time::Instant::now() >= deadline {
+    if budget.remaining_ms().is_err() {
       return Err(FerriError::Backend(launch_failure_detail(
         &format!(
-          "timed out after 10000ms waiting for {} to write {}",
+          "timed out after {}ms waiting for {} to write {}",
+          budget.timeout_ms(),
           chromium_path,
           port_file.display()
         ),
@@ -313,6 +322,54 @@ fn launch_failure_detail(what: &str, stderr_tail: &crate::backend::process::Stde
 mod tests {
   use super::launch_failure_detail;
   use crate::backend::process::StderrTail;
+
+  fn silent_browser() -> tokio::process::Child {
+    tokio::process::Command::new("sh")
+      .args(["-c", "exec sleep 120"])
+      .kill_on_drop(true)
+      .spawn()
+      .unwrap()
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_port_file_wait_follows_the_launch_timeout_past_the_old_ten_seconds() {
+    use crate::operation_budget::OperationBudget;
+    let folder = tempfile::tempdir().unwrap();
+    let port_file = folder.path().join("DevToolsActivePort");
+    let written = port_file.clone();
+    let writing = tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+      tokio::fs::write(&written, "9222\n/devtools/browser/late\n")
+        .await
+        .unwrap();
+    });
+    let mut child = silent_browser();
+    let url = OperationBudget::new(20_000)
+      .unwrap()
+      .scope(super::discover_ws_url(
+        &port_file,
+        &mut child,
+        "chromium",
+        &StderrTail::default(),
+      ))
+      .await
+      .unwrap();
+    writing.await.unwrap();
+    assert_eq!(url, "ws://127.0.0.1:9222/devtools/browser/late");
+    let unwritten = folder.path().join("NeverWritten");
+    let error = OperationBudget::new(20_000)
+      .unwrap()
+      .scope(super::discover_ws_url(
+        &unwritten,
+        &mut child,
+        "chromium",
+        &StderrTail::default(),
+      ))
+      .await
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("timed out after 20000ms"), "{error}");
+  }
 
   #[tokio::test(start_paused = true)]
   async fn operation_budgets_cover_replies_queueing_and_cancellation() {

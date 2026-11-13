@@ -609,6 +609,16 @@ pub struct RequestInit {
 /// no request at all (same-document, back/forward cache) is not held up.
 pub const NAV_REQUEST_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+pub(crate) fn document_response_wait() -> std::time::Duration {
+  match crate::operation_budget::OperationBudget::capture().map(crate::operation_budget::OperationBudget::remaining_ms)
+  {
+    Some(Ok(Some(ms))) => std::time::Duration::from_millis(ms),
+    Some(Ok(None)) => std::time::Duration::MAX,
+    Some(Err(_)) => std::time::Duration::ZERO,
+    None => NAV_REQUEST_GRACE,
+  }
+}
+
 /// A navigation request and the document loader it belongs to.
 type LoaderRequest = (Option<String>, Request);
 
@@ -706,7 +716,7 @@ impl NavRequestSlot {
     if let Some(request) = self.get_for(loader_id) {
       return Some(request);
     }
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     loop {
       let notified = self.filled.notified();
       tokio::pin!(notified);
@@ -716,7 +726,13 @@ impl NavRequestSlot {
       if let Some(request) = self.get_for(loader_id) {
         return Some(request);
       }
-      if tokio::time::timeout_at(deadline, notified).await.is_err() {
+      let woke = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, notified).await.is_ok()
+      } else {
+        notified.await;
+        true
+      };
+      if !woke {
         return self.get_for(loader_id);
       }
     }
@@ -1368,6 +1384,80 @@ mod tests {
       "the close handshake"
     );
     assert!(websocket_frame_payload(&frame(9, "ping")).is_none());
+  }
+
+  fn document_request(id: &str) -> Request {
+    Request::new(RequestInit {
+      id: id.into(),
+      url: "http://example.test/".into(),
+      method: "GET".into(),
+      resource_type: "Document".into(),
+      is_navigation_request: true,
+      post_data: None,
+      headers: Headers::default(),
+      frame_id: None,
+      page_guid: None,
+      redirected_from: None,
+      timing: None,
+      raw_headers_fn: None,
+    })
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_document_response_wait_is_the_navigations_remaining_budget() {
+    assert_eq!(document_response_wait(), NAV_REQUEST_GRACE);
+    let budget = crate::operation_budget::OperationBudget::new(60_000).unwrap();
+    let remaining = budget
+      .scope(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        document_response_wait()
+      })
+      .await;
+    assert_eq!(remaining, std::time::Duration::from_secs(50));
+    let unlimited = crate::operation_budget::OperationBudget::new(0)
+      .unwrap()
+      .scope(async { document_response_wait() })
+      .await;
+    assert_eq!(unlimited, std::time::Duration::MAX);
+    let spent = crate::operation_budget::OperationBudget::new(100)
+      .unwrap()
+      .scope(async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        document_response_wait()
+      })
+      .await;
+    assert_eq!(spent, std::time::Duration::ZERO);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_document_request_seen_after_the_old_quarter_second_still_answers_the_navigation() {
+    let slot = Arc::new(NavRequestSlot::new());
+    let filler = Arc::clone(&slot);
+    let late = tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+      filler.set(document_request("late-document"));
+    });
+    let found = crate::operation_budget::OperationBudget::new(60_000)
+      .unwrap()
+      .scope(async { slot.wait_for(None, document_response_wait()).await })
+      .await;
+    late.await.unwrap();
+    assert_eq!(
+      found.map(|request| request.url().to_owned()).as_deref(),
+      Some("http://example.test/")
+    );
+    let unlimited_slot = Arc::new(NavRequestSlot::new());
+    let filler = Arc::clone(&unlimited_slot);
+    let late = tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+      filler.set(document_request("unlimited-document"));
+    });
+    let found = crate::operation_budget::OperationBudget::new(0)
+      .unwrap()
+      .scope(async { unlimited_slot.wait_for(None, document_response_wait()).await })
+      .await;
+    late.await.unwrap();
+    assert!(found.is_some());
   }
 
   #[tokio::test]

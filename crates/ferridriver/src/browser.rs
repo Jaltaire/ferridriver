@@ -813,7 +813,8 @@ impl Browser {
     if let Some(reason) = opts.and_then(|o| o.reason) {
       state.set_close_reason(reason);
     }
-    let result = state.shutdown().await;
+    let timeout = state.launch_timeout_or_default();
+    let result = crate::operation_budget::within_boxed(timeout, state.shutdown()).await;
     drop(state);
     if first_close {
       self.announce_disconnect(contexts);

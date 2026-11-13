@@ -557,6 +557,13 @@ impl LifecycleSignals {
 }
 
 impl WebKitPage {
+  pub(crate) fn own_command_timeouts(&self) {
+    self
+      .proxy
+      .connection_handle()
+      .register_owner_timeout(&self.proxy_id, self.page_backref.default_timeout_source());
+  }
+
   /// Attach to a freshly-created page proxy: wait for the inner
   /// `Target.targetCreated`, open the target session, run the standard
   /// `*.enable` initialisation (mirrors `WKPage._initializeSessionMayThrow`).
@@ -586,7 +593,7 @@ impl WebKitPage {
       // stashed, the page kept sending to the destroyed target, and every
       // later call blocked with no response to wait for.
       let mut proxy_rx = proxy.events();
-      let (target_id, is_paused) = wait_for_first_page_target(&mut proxy_rx).await?;
+      let (target_id, is_paused) = wait_for_first_page_target(&proxy, &mut proxy_rx).await?;
       let target = conn.target_session(&proxy_id, &target_id);
       // Same reason for the target session: everything between here and
       // `attach_listeners` is awaited protocol work, and the events are
@@ -1023,15 +1030,22 @@ impl WebKitPage {
   /// ids). Erroring instead of falling back keeps a frame-scoped
   /// evaluate from silently running in the main frame.
   async fn resolve_frame_context(&self, frame_id: &str) -> Result<i64> {
-    for _ in 0..200u32 {
-      if let Some(id) = self.frame_contexts.read().await.get(frame_id).copied() {
-        return Ok(id);
-      }
-      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    Err(FerriError::backend(format!(
-      "webkit: no execution context found for frame '{frame_id}'. Frame may not be loaded yet."
-    )))
+    let budget = self.page_backref.budget(2_000)?;
+    budget
+      .wait(async {
+        loop {
+          if let Some(id) = self.frame_contexts.read().await.get(frame_id).copied() {
+            return id;
+          }
+          tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+      })
+      .await
+      .map_err(|_| {
+        FerriError::backend(format!(
+          "webkit: no execution context found for frame '{frame_id}'. Frame may not be loaded yet."
+        ))
+      })
   }
 
   /// `this` objectId in a specific execution context — the frame-scoped
@@ -1189,6 +1203,21 @@ impl WebKitPage {
     timeout_ms: u64,
     referrer: Option<&str>,
   ) -> Result<Option<Response>> {
+    crate::operation_budget::scoped_boxed(
+      timeout_ms,
+      || format!("navigating to {url}"),
+      self.goto_within(url, lifecycle, timeout_ms, referrer),
+    )
+    .await
+  }
+
+  async fn goto_within(
+    &self,
+    url: &str,
+    lifecycle: NavLifecycle,
+    timeout_ms: u64,
+    referrer: Option<&str>,
+  ) -> Result<Option<Response>> {
     self.ensure_open()?;
     self.reset_realm();
     self.nav_request_slot.clear();
@@ -1225,7 +1254,7 @@ impl WebKitPage {
       self
         .wait_for_lifecycle(lifecycle, timeout_ms, parsed.loader_id.as_deref())
         .await?;
-      crate::network::NAV_REQUEST_GRACE
+      crate::network::document_response_wait()
     } else {
       // No loaderId: a same-document jump, which requested nothing.
       std::time::Duration::ZERO
@@ -1288,9 +1317,9 @@ impl WebKitPage {
     }
   }
 
-  pub async fn wait_for_navigation(&self) -> Result<()> {
+  pub async fn wait_for_navigation(&self, timeout_ms: u64) -> Result<()> {
     self.lifecycle.reset();
-    self.wait_for_lifecycle(NavLifecycle::Load, 30_000, None).await
+    self.wait_for_lifecycle(NavLifecycle::Load, timeout_ms, None).await
   }
 
   /// Force a GC pass in the page's JS engine. Mirrors Playwright's
@@ -1316,7 +1345,7 @@ impl WebKitPage {
       .await
       .map_err(conn_err)?;
     self.wait_for_lifecycle(lifecycle, timeout_ms, None).await?;
-    Ok(self.await_nav_response(crate::network::NAV_REQUEST_GRACE).await)
+    Ok(self.await_nav_response(crate::network::document_response_wait()).await)
   }
 
   pub async fn go_back(&self, lifecycle: NavLifecycle, timeout_ms: u64) -> Result<Option<Response>> {
@@ -2934,7 +2963,14 @@ impl WebKitPage {
       "Target.close",
       json!({ "targetId": target_id.to_string(), "runBeforeUnload": false }),
     );
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send).await;
+    match self.page_backref.budget(2_000) {
+      Ok(budget) => {
+        let _ = budget.wait(send).await;
+      },
+      Err(_) => {
+        let _ = send.await;
+      },
+    }
     // Reject pending in-flight calls bound to this page's proxy + target
     // routes so successive callers don't pile up indefinitely.
     let conn = self.proxy.connection_handle();
@@ -3044,20 +3080,34 @@ async fn grant_permissions(proxy: &Session, opts: &crate::options::BrowserContex
 /// target arrived paused (`isPaused` — browser-created popups do; the
 /// caller resumes after session init).
 async fn wait_for_first_page_target(
+  proxy: &Session,
   rx: &mut tokio::sync::mpsc::UnboundedReceiver<Envelope>,
 ) -> std::result::Result<(String, bool), BrowserError> {
-  while let Some(env) = rx.recv().await {
-    if let Some(id) = page_target_id(&env) {
-      let paused = env
-        .params
-        .get("targetInfo")
-        .and_then(|i| i.get("isPaused"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-      return Ok((id, paused));
-    }
-  }
-  Err(BrowserError::Protocol("page proxy closed before target".into()))
+  let budget = proxy
+    .owner_budget(30_000)
+    .map_err(|error| BrowserError::Protocol(error.to_string()))?;
+  budget
+    .wait(async {
+      while let Some(env) = rx.recv().await {
+        if let Some(id) = page_target_id(&env) {
+          let paused = env
+            .params
+            .get("targetInfo")
+            .and_then(|i| i.get("isPaused"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+          return Ok((id, paused));
+        }
+      }
+      Err(BrowserError::Protocol("page proxy closed before target".into()))
+    })
+    .await
+    .map_err(|expired| {
+      BrowserError::Connection(super::connection::ConnectionError::Timeout {
+        method: "Target.targetCreated".into(),
+        ms: expired.timeout_ms,
+      })
+    })?
 }
 
 fn page_target_id(env: &Envelope) -> Option<String> {
@@ -3173,6 +3223,62 @@ mod tests {
     DESKTOP_ORIENTATION_SHIM, EngineLatch, LifecycleSignals, NavLifecycle, SAFARI_SURFACE_SHIM, WebKitPage,
     navigator_platform_for,
   };
+
+  const HUNG: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+  fn target_created() -> super::Envelope {
+    serde_json::from_value(serde_json::json!({
+      "method": "Target.targetCreated",
+      "params": {"targetInfo": {"targetId": "target", "type": "page"}},
+    }))
+    .unwrap()
+  }
+
+  fn timed_out_after(
+    outcome: &Result<std::result::Result<(String, bool), super::BrowserError>, tokio::time::error::Elapsed>,
+    ms: u64,
+  ) -> bool {
+    matches!(
+      outcome,
+      Ok(Err(super::BrowserError::Connection(
+        super::super::connection::ConnectionError::Timeout { ms: expired, .. }
+      ))) if *expired == ms
+    )
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_first_target_wait_follows_the_page_creation_scope_and_a_popups_opener() {
+    use crate::operation_budget::OperationBudget;
+    let (read, _input) = tokio::io::duplex(64);
+    let (write, _output) = tokio::io::duplex(64);
+    let connection = super::super::connection::Connection::spawn(super::super::transport::Transport::new(read, write));
+    let proxy = connection.page_proxy_session("popup");
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let announcing = tokio::spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+      sender.send(target_created()).unwrap();
+      sender
+    });
+    let found = OperationBudget::new(60_000)
+      .unwrap()
+      .scope(super::wait_for_first_page_target(&proxy, &mut events))
+      .await
+      .unwrap();
+    assert_eq!(found, ("target".to_owned(), false));
+    let _sender = announcing.await.unwrap();
+    let scoped = tokio::time::timeout(
+      HUNG,
+      OperationBudget::new(500)
+        .unwrap()
+        .scope(super::wait_for_first_page_target(&proxy, &mut events)),
+    )
+    .await;
+    assert!(timed_out_after(&scoped, 500));
+    connection.register_owner_timeout("opener", std::sync::Arc::new(|| Some(700_u64)));
+    connection.inherit_owner_timeout("opener", "popup");
+    let inherited = tokio::time::timeout(HUNG, super::wait_for_first_page_target(&proxy, &mut events)).await;
+    assert!(timed_out_after(&inherited, 700));
+  }
 
   #[test]
   fn the_previous_document_loading_late_does_not_finish_a_navigation() {

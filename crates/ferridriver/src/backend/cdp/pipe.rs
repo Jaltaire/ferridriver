@@ -172,7 +172,7 @@ impl super::transport::CdpTransport for PipeTransport {
     method: &str,
     params: &serde_json::Value,
   ) -> Result<serde_json::Value> {
-    let budget = crate::operation_budget::OperationBudget::current(30_000)?;
+    let budget = self.dispatcher.command_budget(session_id, 30_000)?;
     let (id, data, rx) = self.dispatcher.build_command(session_id, method, params)?;
     let mut pending = self.dispatcher.pending_command(id);
     budget.send(&self.write_tx, data).await?;
@@ -244,6 +244,14 @@ impl super::transport::CdpTransport for PipeTransport {
 
   fn unregister_session(&self, session_id: &str) {
     self.dispatcher.unregister_session(session_id);
+  }
+
+  fn register_owner_timeout(&self, session_id: &str, source: crate::operation_budget::TimeoutSource) {
+    self.dispatcher.register_owner_timeout(session_id, source);
+  }
+
+  fn inherit_owner_timeout(&self, from: &str, to: &str) {
+    self.dispatcher.inherit_owner_timeout(from, to);
   }
 }
 
@@ -463,6 +471,227 @@ mod tests {
       android: None,
     };
     browser.adopted_page("frame".into(), Some(session.into()))
+  }
+
+  type Held = Arc<std::sync::Mutex<Vec<(String, u64)>>>;
+
+  struct Browser {
+    dispatcher: Arc<CdpDispatcher>,
+    transport: Arc<PipeTransport>,
+    held: Held,
+    asked: Arc<std::sync::Mutex<Vec<String>>>,
+  }
+
+  impl Browser {
+    fn answering(answer: fn(&str) -> Option<serde_json::Value>) -> Self {
+      let dispatcher = Arc::new(CdpDispatcher::new());
+      let (write_tx, mut queued) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+      let transport = Arc::new(PipeTransport {
+        write_tx,
+        dispatcher: dispatcher.clone(),
+        tasks: crate::backend::transport_tasks::TransportTasks::new(tokio::sync::watch::channel(false).0, Vec::new()),
+      });
+      let held: Held = Arc::default();
+      let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+      let (replies, holds, log) = (dispatcher.clone(), held.clone(), asked.clone());
+      tokio::spawn(async move {
+        while let Some(message) = queued.recv().await {
+          let request: serde_json::Value = serde_json::from_slice(message.strip_suffix(&[0]).unwrap()).unwrap();
+          let method = request["method"].as_str().unwrap().to_owned();
+          let id = request["id"].as_u64().unwrap();
+          log.lock().unwrap().push(method.clone());
+          match answer(&method) {
+            Some(result) => {
+              replies.dispatch_message(&serde_json::to_vec(&serde_json::json!({"id": id, "result": result})).unwrap());
+            },
+            None => holds.lock().unwrap().push((method, id)),
+          }
+        }
+      });
+      Self {
+        dispatcher,
+        transport,
+        held,
+        asked,
+      }
+    }
+
+    fn page(&self, session: &str) -> super::super::CdpPage<PipeTransport> {
+      use super::super::transport::CdpTransport as _;
+      let page = context_test_page(self.transport.clone(), session);
+      self.transport.register_lifecycle_tracker(
+        session,
+        page.lifecycle.clone(),
+        page.lifecycle_notify.clone(),
+        page.frame_observer(),
+      );
+      page
+    }
+
+    fn held(&self, method: &str) -> Option<u64> {
+      self
+        .held
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(held, _)| held == method)
+        .map(|(_, id)| *id)
+    }
+
+    fn reply(&self, id: u64, result: &serde_json::Value) {
+      self
+        .dispatcher
+        .dispatch_message(&serde_json::to_vec(&serde_json::json!({"id": id, "result": result})).unwrap());
+    }
+
+    fn event(&self, event: &serde_json::Value) {
+      self.dispatcher.dispatch_message(&serde_json::to_vec(event).unwrap());
+    }
+
+    fn times_asked(&self, method: &str) -> usize {
+      self
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|asked| *asked == method)
+        .count()
+    }
+  }
+
+  async fn settle() {
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+    }
+  }
+
+  fn holding(method: &str) -> Option<serde_json::Value> {
+    match method {
+      "Page.enable" | "Runtime.evaluate" | "Page.captureScreenshot" => None,
+      "IO.read" => Some(serde_json::json!({"data": "[]", "eof": true})),
+      _ => Some(serde_json::json!({})),
+    }
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn an_owned_page_session_bounds_unscoped_commands_by_the_pages_default_timeout() {
+    use super::super::transport::CdpTransport as _;
+    for default in [0, 90_000] {
+      let browser = Browser::answering(holding);
+      let page = crate::page::Page::new(crate::backend::AnyPage::CdpPipe(browser.page("owned")));
+      page.set_default_timeout(default);
+      let params = serde_json::json!({});
+      let mut command = Box::pin(browser.transport.send_command(Some("owned"), "Page.enable", &params));
+      assert!(futures::poll!(&mut command).is_pending());
+      settle().await;
+      let id = browser.held("Page.enable").unwrap();
+      tokio::time::advance(std::time::Duration::from_secs(61)).await;
+      assert!(futures::poll!(&mut command).is_pending());
+      browser.reply(id, &serde_json::json!({"enabled": true}));
+      assert_eq!(command.await.unwrap()["enabled"], true);
+    }
+    let browser = Browser::answering(holding);
+    let page = crate::page::Page::new(crate::backend::AnyPage::CdpPipe(browser.page("owned")));
+    page.set_default_timeout(500);
+    let error = browser
+      .transport
+      .send_command(Some("owned"), "Page.enable", &serde_json::json!({}))
+      .await
+      .unwrap_err();
+    assert!(error.is_timeout_error());
+    assert!(error.to_string().contains("500ms"), "{error}");
+    drop(page);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_child_frame_context_announced_after_the_old_two_seconds_still_resolves() {
+    use crate::operation_budget::OperationBudget;
+    let browser = Browser::answering(holding);
+    let page = browser.page("session");
+    let mut resolving = Box::pin(
+      OperationBudget::new(60_000)
+        .unwrap()
+        .scope(page.resolve_frame_context("child")),
+    );
+    assert!(futures::poll!(&mut resolving).is_pending());
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    assert!(futures::poll!(&mut resolving).is_pending());
+    browser.event(
+      &serde_json::json!({"sessionId":"session","method":"Runtime.executionContextCreated",
+      "params":{"context":{"id":21,"auxData":{"frameId":"child","isDefault":true}}}}),
+    );
+    assert_eq!(resolving.await.unwrap(), 21);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn drag_detection_waits_for_a_frame_slower_than_the_old_second() {
+    use crate::operation_budget::OperationBudget;
+    let browser = Browser::answering(holding);
+    let page = browser.page("session");
+    let mut detecting = Box::pin(
+      OperationBudget::new(60_000)
+        .unwrap()
+        .scope(page.eval_bool_in_all_contexts("true", false)),
+    );
+    assert!(futures::poll!(&mut detecting).is_pending());
+    settle().await;
+    let id = browser.held("Runtime.evaluate").unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(1_500)).await;
+    assert!(futures::poll!(&mut detecting).is_pending());
+    browser.reply(id, &serde_json::json!({"result": {"value": true}}));
+    assert_eq!(detecting.await, vec![true]);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_drag_intercepted_after_the_old_two_seconds_still_starts_the_drag() {
+    use crate::operation_budget::OperationBudget;
+    let browser = Browser::answering(holding);
+    let page = browser.page("session");
+    let mut intercepting = Box::pin(OperationBudget::new(60_000).unwrap().scope(page.intercepted_drag()));
+    assert!(futures::poll!(&mut intercepting).is_pending());
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    assert!(futures::poll!(&mut intercepting).is_pending());
+    *page.drag_manager.intercepted_slot.lock().unwrap() = Some(serde_json::json!({"items": []}));
+    page.drag_manager.intercepted_notify.notify_one();
+    assert_eq!(intercepting.await.unwrap(), Some(serde_json::json!({"items": []})));
+    let expired = OperationBudget::new(700)
+      .unwrap()
+      .scope(page.intercepted_drag())
+      .await
+      .unwrap();
+    assert_eq!(expired, None);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_front_tab_is_asked_again_until_the_screenshot_budget_runs_out() {
+    use crate::operation_budget::OperationBudget;
+    let browser = Browser::answering(holding);
+    let page = browser.page("session");
+    let outcome = OperationBudget::new(20_000)
+      .unwrap()
+      .scope(page.bring_to_front_drawn())
+      .await;
+    assert!(outcome.unwrap_err().is_timeout_error());
+    let asked = browser.times_asked("Page.bringToFront");
+    assert!(asked >= 26, "the front tab was asked {asked} times in 20 seconds");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn tracing_waits_for_its_completion_past_the_old_thirty_seconds() {
+    use crate::operation_budget::OperationBudget;
+    let browser = Browser::answering(holding);
+    let page = browser.page("session");
+    let mut stopping = Box::pin(OperationBudget::new(60_000).unwrap().scope(page.stop_tracing()));
+    assert!(futures::poll!(&mut stopping).is_pending());
+    settle().await;
+    assert_eq!(browser.times_asked("Tracing.end"), 1);
+    assert!(futures::poll!(&mut stopping).is_pending());
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(futures::poll!(&mut stopping).is_pending());
+    browser.event(
+      &serde_json::json!({"sessionId":"session","method":"Tracing.tracingComplete","params":{"stream":"trace"}}),
+    );
+    assert_eq!(stopping.await.unwrap(), Vec::<serde_json::Value>::new());
   }
 
   #[tokio::test(flavor = "current_thread")]

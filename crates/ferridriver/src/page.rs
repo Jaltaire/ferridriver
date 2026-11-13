@@ -22,7 +22,7 @@ use tokio::sync::Mutex as AsyncMutex;
 const UNSET_TIMEOUT: u64 = u64::MAX;
 
 /// Playwright's floor when nothing in the chain sets a timeout.
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// High-level page API, mirrors Playwright's Page interface.
 /// Always constructed behind `Arc<Page>` — locators, frames, and consumers
@@ -855,7 +855,10 @@ impl Page {
     let trace_span = self.trace_span("goBack", serde_json::json!({}));
     let trace_span = crate::trace::open_action(self.snapshot_before(trace_span).await).await;
     let result = self
-      .finish_navigation(self.inner.go_back(lifecycle, timeout).await)
+      .finish_navigation(
+        crate::operation_budget::scoped_boxed(timeout, || "going back".into(), self.inner.go_back(lifecycle, timeout))
+          .await,
+      )
       .await;
     if let Some(span) = trace_span {
       self.snapshot_after_and_finish(span, result.as_ref().err()).await;
@@ -882,7 +885,14 @@ impl Page {
     let trace_span = self.trace_span("goForward", serde_json::json!({}));
     let trace_span = crate::trace::open_action(self.snapshot_before(trace_span).await).await;
     let result = self
-      .finish_navigation(self.inner.go_forward(lifecycle, timeout).await)
+      .finish_navigation(
+        crate::operation_budget::scoped_boxed(
+          timeout,
+          || "going forward".into(),
+          self.inner.go_forward(lifecycle, timeout),
+        )
+        .await,
+      )
       .await;
     if let Some(span) = trace_span {
       self.snapshot_after_and_finish(span, result.as_ref().err()).await;
@@ -909,7 +919,9 @@ impl Page {
     let trace_span = self.trace_span("reload", serde_json::json!({}));
     let trace_span = crate::trace::open_action(self.snapshot_before(trace_span).await).await;
     let pre_nav = self.observed_lens();
-    let result = self.inner.reload(lifecycle, timeout).await;
+    let result =
+      crate::operation_budget::scoped_boxed(timeout, || "reloading".into(), self.inner.reload(lifecycle, timeout))
+        .await;
     let navigation_succeeded = result.is_ok();
     let result = self.finish_navigation(result).await;
     if let Some(span) = trace_span {
@@ -2301,12 +2313,12 @@ impl Page {
     if !opts.mask.is_empty() {
       self.inner.ensure_engine_injected().await?;
     }
-    let budget =
-      crate::operation_budget::OperationBudget::operation(opts.timeout.unwrap_or_else(|| self.default_timeout()))?;
-    let capture = crate::screenshotter::screenshot_page(self, &opts);
-    let bytes = futures::FutureExt::boxed(budget.scope(budget.wait(capture)))
-      .await
-      .map_err(|expired| expired.error("screenshot"))??;
+    let bytes = crate::operation_budget::scoped_boxed(
+      opts.timeout.unwrap_or_else(|| self.default_timeout()),
+      || "screenshot".into(),
+      crate::screenshotter::screenshot_page(self, &opts),
+    )
+    .await?;
     if let Some(ref path) = opts.path {
       if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -2788,7 +2800,12 @@ impl Page {
   ///
   /// [`crate::error::FerriError::Unsupported`] on the `BiDi` and `WebKit` backends.
   pub async fn stop_tracing(&self) -> Result<Vec<serde_json::Value>> {
-    self.inner.stop_tracing().await
+    crate::operation_budget::scoped_boxed(
+      self.default_timeout(),
+      || "stopping tracing".into(),
+      self.inner.stop_tracing(),
+    )
+    .await
   }
 
   /// Get performance metrics from the page.
@@ -2953,7 +2970,12 @@ impl Page {
       Err(error) if error.is_unsupported() => {
         return self
           .inner
-          .goto(origin, crate::backend::NavLifecycle::Load, 10_000, None)
+          .goto(
+            origin,
+            crate::backend::NavLifecycle::Load,
+            self.default_navigation_timeout(),
+            None,
+          )
           .await
           .map(|_| ());
       },
@@ -2961,7 +2983,12 @@ impl Page {
     }
     let navigation = self
       .inner
-      .goto(origin, crate::backend::NavLifecycle::Load, 10_000, None)
+      .goto(
+        origin,
+        crate::backend::NavLifecycle::Load,
+        self.default_navigation_timeout(),
+        None,
+      )
       .await;
     let cleanup = self
       .inner
@@ -4685,7 +4712,7 @@ impl Page {
         *guard = Some(reason);
       }
     }
-    self.inner.close_page(opts).await?;
+    crate::operation_budget::within_boxed(self.default_timeout(), self.inner.close_page(opts)).await?;
     // Playwright emits 'close' on the page once it is closed.
     self.inner.events().emit(PageEvent::Close);
 

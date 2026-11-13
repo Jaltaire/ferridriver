@@ -130,19 +130,17 @@ impl Frame {
     arg: crate::protocol::SerializedArgument,
     is_function: Option<bool>,
   ) -> Result<crate::protocol::SerializedValue> {
-    let budget = crate::operation_budget::OperationBudget::operation(self.page.default_timeout())?;
     self
       .page
       .traced_as(
         "Frame",
         "evaluate",
         serde_json::json!({ "expression": fn_source }),
-        futures::FutureExt::boxed(budget.scope(async move {
-          budget
-            .wait(self.evaluate_untraced(fn_source, arg, is_function))
-            .await
-            .map_err(|expired| expired.error("evaluate"))?
-        })),
+        crate::operation_budget::scoped_boxed(
+          self.page.default_timeout(),
+          || "evaluate".into(),
+          self.evaluate_untraced(fn_source, arg, is_function),
+        ),
       )
       .await
   }
@@ -258,6 +256,21 @@ impl Frame {
     options: Option<crate::options::WaitForFunctionOptions>,
   ) -> Result<crate::js_handle::JSHandle> {
     let opts = options.unwrap_or_default();
+    let timeout = opts.timeout.unwrap_or_else(|| self.page.default_timeout());
+    crate::operation_budget::within_boxed(
+      timeout,
+      self.wait_for_function_within(fn_source, arg, is_function, opts),
+    )
+    .await
+  }
+
+  async fn wait_for_function_within(
+    &self,
+    fn_source: &str,
+    arg: crate::protocol::SerializedArgument,
+    is_function: Option<bool>,
+    opts: crate::options::WaitForFunctionOptions,
+  ) -> Result<crate::js_handle::JSHandle> {
     let polling = opts.polling.unwrap_or(crate::options::Polling::Raf);
     let timeout = opts.timeout.unwrap_or_else(|| self.page.default_timeout());
     let deadline = (timeout != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout));
@@ -1146,6 +1159,20 @@ impl Frame {
 
   pub(crate) async fn set_content_impl(&self, html: &str, opts: crate::options::SetContentOptions) -> Result<()> {
     let timeout_ms = opts.timeout.unwrap_or_else(|| self.page.default_navigation_timeout());
+    crate::operation_budget::scoped_boxed(
+      timeout_ms,
+      || "setting the content".into(),
+      self.set_content_within(html, opts, timeout_ms),
+    )
+    .await
+  }
+
+  async fn set_content_within(
+    &self,
+    html: &str,
+    opts: crate::options::SetContentOptions,
+    timeout_ms: u64,
+  ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let wait_until = opts.wait_until.unwrap_or_default();
     let state = if self.is_main_frame() {
