@@ -57,7 +57,7 @@ async fn observe(state: &mut BrowserState, scenario: Scenario, profile: &Path) -
       .await?;
     return Ok(json!({ "size": size }));
   }
-  let page = Box::pin(state.open_page("default", "about:blank")).await?;
+  let page = Box::pin(state.open_page("default", "about:blank", ferridriver::page::DEFAULT_TIMEOUT_MS)).await?;
   let mut maximized = Value::Null;
   if matches!(scenario, Scenario::Maximized) {
     let session = page.new_cdp_session().await?;

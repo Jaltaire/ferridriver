@@ -78,7 +78,7 @@ step!(WaitNavigation {
     description: "Wait for next navigation",
     example: "And I wait for navigation",
     execute(page, _caps, _table, _vars) {
-        let _ = page.inner().wait_for_navigation().await;
+        let _ = page.inner().wait_for_navigation(page.default_navigation_timeout()).await;
         Ok(None)
     }
 });

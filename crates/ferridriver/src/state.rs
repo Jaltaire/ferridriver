@@ -2030,13 +2030,22 @@ impl BrowserState {
     // server launched, leaving the process alive with no handle to close it.
     self.evict_instance(instance_name).await?;
 
-    let ws_url = if url.starts_with("ws://") || url.starts_with("wss://") {
-      url.to_string()
-    } else {
-      discover_ws_from_http(url).await?
+    let connect = async {
+      let ws_url = if url.starts_with("ws://") || url.starts_with("wss://") {
+        url.to_string()
+      } else {
+        discover_ws_from_http(url).await?
+      };
+      Ok(AnyBrowser::CdpWs(
+        Box::pin(CdpBrowser::<WsTransport>::connect(&ws_url)).await?,
+      ))
     };
-
-    let browser = AnyBrowser::CdpWs(Box::pin(CdpBrowser::<WsTransport>::connect(&ws_url)).await?);
+    let browser = crate::operation_budget::scoped_boxed(
+      self.launch_timeout_or_default(),
+      || format!("connecting to {url}"),
+      connect,
+    )
+    .await?;
     // Skip viewport override for existing pages — connect_to_url attaches to a
     // user-managed browser whose window size should not be touched.
     Box::pin(self.install_instance(instance_name, browser, true, true)).await?;
@@ -2158,10 +2167,11 @@ impl BrowserState {
   ///
   /// Returns an error if the instance or page creation fails.
   /// Create a new page in the given context. Returns the `AnyPage` directly
-  /// (no second lookup needed).
-  pub async fn open_page(&mut self, context: &str, url: &str) -> Result<AnyPage> {
+  /// (no second lookup needed). `timeout_ms` bounds opening the page and
+  /// navigating it to `url`; 0 waits without a limit.
+  pub async fn open_page(&mut self, context: &str, url: &str, timeout_ms: u64) -> Result<AnyPage> {
     let key = self.session_key(context);
-    Box::pin(self.open_page_keyed(&key, url)).await
+    Box::pin(self.open_page_keyed(&key, url, timeout_ms)).await
   }
 
   /// Snapshot the immutable data needed to open a page without holding the
@@ -2325,12 +2335,21 @@ impl BrowserState {
   ///
   /// # Errors
   ///
-  /// Returns an error if the browser instance or page creation fails.
-  pub async fn open_page_keyed(&mut self, key: &SessionKey, url: &str) -> Result<AnyPage> {
+  /// Returns an error if the browser instance or page creation fails, or
+  /// if opening the page outlasts `timeout_ms`.
+  pub async fn open_page_keyed(&mut self, key: &SessionKey, url: &str, timeout_ms: u64) -> Result<AnyPage> {
     if !self.instances.contains_key(&*key.instance) {
       Box::pin(self.ensure_instance(&key.instance)).await?;
     }
+    crate::operation_budget::scoped_boxed(
+      timeout_ms,
+      || format!("opening {url}"),
+      self.open_registered_page(key, url),
+    )
+    .await
+  }
 
+  async fn open_registered_page(&mut self, key: &SessionKey, url: &str) -> Result<AnyPage> {
     let plan = self.page_open_plan(key)?;
     let (page, cdp_ctx_id) = if &*key.context == "default" {
       (
@@ -2756,6 +2775,10 @@ impl BrowserState {
     let inst = self.instance(&key.instance)?;
     let ctx = inst.context(&key.context)?;
     Ok(ctx.dialog_messages(limit).await)
+  }
+
+  pub(crate) fn launch_timeout_or_default(&self) -> u64 {
+    self.launch_timeout.unwrap_or(crate::page::DEFAULT_TIMEOUT_MS)
   }
 
   /// # Errors
