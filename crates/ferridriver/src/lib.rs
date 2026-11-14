@@ -60,6 +60,8 @@ pub mod locator_handler;
 pub mod network;
 pub mod observed;
 mod operation_budget;
+#[doc(hidden)]
+pub use operation_budget::fallbacks_during;
 pub mod options;
 pub mod page;
 pub mod page_tools;

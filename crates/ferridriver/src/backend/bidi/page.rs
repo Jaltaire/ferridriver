@@ -968,12 +968,13 @@ impl BidiPage {
     .map_err(|_| FerriError::timeout("processing navigation events", timeout_ms))?
   }
 
-  pub async fn wait_for_navigation(&self) -> Result<()> {
+  pub async fn wait_for_navigation(&self, timeout_ms: u64) -> Result<()> {
     // Tap the load event for this context and wait for it — a missed
-    // event here is a 30s hang, so the wait must be lossless.
+    // event here is a hang until the timeout, so the wait must be lossless.
     let mut rx = self.session.transport.tap_events();
     let ctx = self.context_id.clone();
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+    let budget = crate::operation_budget::OperationBudget::new(timeout_ms)?;
+    let timeout = budget.wait(async move {
       while let Some(event) = rx.recv().await {
         if event.method == "browsingContext.load"
           && let Some(c) = event.params.get("context").and_then(|v| v.as_str())
@@ -986,7 +987,7 @@ impl BidiPage {
     });
     match timeout.await {
       Ok(result) => result,
-      Err(_) => Err(FerriError::timeout("wait_for_navigation", 30_000)),
+      Err(expired) => Err(expired.error("wait_for_navigation")),
     }
   }
 
@@ -2409,6 +2410,7 @@ impl BidiPage {
     let exposed_fns = self.exposed_fns.clone();
     let exposed_session = self.session.clone();
     let exposed_ctx = self.context_id.clone();
+    self.nav_request_slot.feed();
     let tracker = Arc::new(BidiNetworkTracker::new(
       self.session.clone(),
       self.context_id.clone(),

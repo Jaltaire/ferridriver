@@ -291,6 +291,10 @@ pub trait CdpTransport: Send + Sync + 'static {
   /// at all — both grew by an entry per page for the life of the
   /// browser.
   fn unregister_session(&self, session_id: &str);
+
+  fn register_owner_timeout(&self, session_id: &str, source: crate::operation_budget::TimeoutSource);
+
+  fn inherit_owner_timeout(&self, from: &str, to: &str);
 }
 
 // ── Shared dispatch state ──────────────────────────────────────────────────
@@ -467,6 +471,7 @@ pub(crate) struct CdpDispatcher {
   /// Lossless wildcard taps — every event of one exact session, in wire
   /// order. Backs the public `CDPSession` event stream.
   wildcard_taps: Arc<std::sync::Mutex<Vec<EventTap>>>,
+  owner_timeouts: crate::operation_budget::OwnerTimeouts,
   /// Per-method RTT statistics. Only populated when
   /// `FERRIDRIVER_RTT_STATS=1` is set; otherwise the entry insert /
   /// remove path skips the bookkeeping for zero-cost-when-unused.
@@ -604,8 +609,25 @@ impl CdpDispatcher {
       method_taps: Arc::new(DashMap::default()),
       domain_taps: Arc::new(DashMap::default()),
       wildcard_taps: Arc::new(std::sync::Mutex::new(Vec::new())),
+      owner_timeouts: crate::operation_budget::OwnerTimeouts::default(),
       rtt_stats: Arc::new(std::sync::Mutex::new(RttStats::default())),
     }
+  }
+
+  pub(crate) fn command_budget(
+    &self,
+    session_id: Option<&str>,
+    default_ms: u64,
+  ) -> Result<crate::operation_budget::OperationBudget> {
+    self.owner_timeouts.budget(session_id, default_ms)
+  }
+
+  pub fn register_owner_timeout(&self, session_id: &str, source: crate::operation_budget::TimeoutSource) {
+    self.owner_timeouts.register(Arc::from(session_id), source);
+  }
+
+  pub fn inherit_owner_timeout(&self, from: &str, to: &str) {
+    self.owner_timeouts.inherit(from, to);
   }
 
   pub fn tap_iframe_targets(&self) -> IframeTargetSubscription {
@@ -712,6 +734,7 @@ impl CdpDispatcher {
     if session_id.is_empty() {
       return;
     }
+    self.owner_timeouts.forget(session_id);
     self.lifecycle_trackers.remove(session_id);
     lock_or_recover(&self.iframe_targets).forget_session(session_id);
     let drop_session = |taps: &mut Vec<EventTap>| taps.retain(|t| t.session.as_deref() != Some(session_id));
@@ -1302,6 +1325,32 @@ pub(crate) async fn verify_operation_budgets<T: CdpTransport, M>(
 
 #[cfg(test)]
 mod tests {
+  #[tokio::test(start_paused = true)]
+  async fn a_session_owned_by_a_page_is_bounded_by_it_until_the_session_goes_away() {
+    let dispatcher = super::CdpDispatcher::new();
+    dispatcher.register_owner_timeout("page-session", std::sync::Arc::new(|| Some(60_000_u64)));
+    dispatcher.inherit_owner_timeout("page-session", "popup-session");
+    for session in ["page-session", "popup-session"] {
+      assert_eq!(
+        dispatcher.command_budget(Some(session), 30_000).unwrap().timeout_ms(),
+        60_000
+      );
+    }
+    assert_eq!(dispatcher.command_budget(None, 30_000).unwrap().timeout_ms(), 30_000);
+    dispatcher.unregister_session("page-session");
+    let (budget, fallbacks) =
+      crate::operation_budget::fallbacks_during(async { dispatcher.command_budget(Some("page-session"), 30_000) })
+        .await;
+    assert_eq!((budget.unwrap().timeout_ms(), fallbacks), (30_000, 1));
+    assert_eq!(
+      dispatcher
+        .command_budget(Some("popup-session"), 30_000)
+        .unwrap()
+        .timeout_ms(),
+      60_000
+    );
+  }
+
   #[test]
   fn retired_contexts_are_not_replayed_to_later_observers() {
     use serde_json::json;

@@ -112,6 +112,7 @@ pub struct Connection {
   observers: Mutex<FxHashMap<RouteKey, Vec<RouteObserver>>>,
   closed: AtomicBool,
   tasks: crate::backend::transport_tasks::TransportTasks,
+  owner_timeouts: crate::operation_budget::OwnerTimeouts,
 }
 
 impl Connection {
@@ -138,9 +139,18 @@ impl Connection {
       observers: Mutex::new(FxHashMap::default()),
       closed: AtomicBool::new(false),
       tasks: crate::backend::transport_tasks::TransportTasks::new(shutdown, tasks),
+      owner_timeouts: crate::operation_budget::OwnerTimeouts::default(),
     });
     let _ = ready.send(Arc::downgrade(&conn));
     conn
+  }
+
+  pub(crate) fn register_owner_timeout(&self, page_proxy_id: &str, source: crate::operation_budget::TimeoutSource) {
+    self.owner_timeouts.register(Arc::from(page_proxy_id), source);
+  }
+
+  pub(crate) fn inherit_owner_timeout(&self, opener_proxy_id: &str, page_proxy_id: &str) {
+    self.owner_timeouts.inherit(opener_proxy_id, page_proxy_id);
   }
 
   /// Resolves once the inspector pipe has ended.
@@ -211,7 +221,10 @@ impl Connection {
   pub fn close_route(&self, page_proxy_id: Option<&str>, target_id: Option<&str>) {
     let key = match (page_proxy_id, target_id) {
       (_, Some(t)) => RouteKey::Target(t.to_string()),
-      (Some(p), None) => RouteKey::PageProxy(p.to_string()),
+      (Some(p), None) => {
+        self.owner_timeouts.forget(p);
+        RouteKey::PageProxy(p.to_string())
+      },
       (None, None) => RouteKey::Browser,
     };
     let mut callbacks = self.callbacks.lock().unwrap_or_else(PoisonError::into_inner);
@@ -481,10 +494,15 @@ impl Session {
     }
   }
 
+  pub(crate) fn owner_budget(&self, default_ms: u64) -> crate::Result<OperationBudget> {
+    self.conn.owner_timeouts.budget(self.page_proxy_id(), default_ms)
+  }
+
   /// Send `method` and await its reply.
   pub async fn send(&self, method: &str, params: Value) -> Result<Value, ConnectionError> {
-    let budget =
-      OperationBudget::current(REPLY_TIMEOUT_MS).map_err(|error| ConnectionError::Protocol(error.to_string()))?;
+    let budget = self
+      .owner_budget(REPLY_TIMEOUT_MS)
+      .map_err(|error| ConnectionError::Protocol(error.to_string()))?;
     budget.remaining_ms().map_err(|error| ConnectionError::Timeout {
       method: method.into(),
       ms: error.timeout_ms,
@@ -678,9 +696,77 @@ mod tests {
         observers: Mutex::new(FxHashMap::default()),
         closed: AtomicBool::new(false),
         tasks: crate::backend::transport_tasks::TransportTasks::new(tokio::sync::watch::channel(false).0, Vec::new()),
+        owner_timeouts: crate::operation_budget::OwnerTimeouts::default(),
       }),
       queued,
     )
+  }
+
+  fn owned_by(timeout_ms: u64) -> crate::operation_budget::TimeoutSource {
+    Arc::new(move || Some(timeout_ms))
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn an_owned_page_bounds_its_unscoped_commands_by_its_own_timeout() {
+    for timeout in [0, 90_000] {
+      let (connection, mut queued) = connection();
+      connection.register_owner_timeout("page", owned_by(timeout));
+      let session = connection.target_session("page", "target");
+      let mut command = Box::pin(session.send("Page.enable", json!({})));
+      assert!(futures::poll!(&mut command).is_pending());
+      let (wrapper, inner) = ids(&mut queued).await;
+      tokio::time::advance(std::time::Duration::from_secs(31)).await;
+      assert!(futures::poll!(&mut command).is_pending());
+      connection.complete(wrapper, Ok(json!({})));
+      tokio::time::advance(std::time::Duration::from_secs(31)).await;
+      assert!(futures::poll!(&mut command).is_pending());
+      connection.complete(inner, Ok(json!({"enabled":true})));
+      assert_eq!(command.await.unwrap()["enabled"], true);
+    }
+    let (connection, mut queued) = connection();
+    connection.register_owner_timeout("page", owned_by(500));
+    let session = connection.target_session("page", "target");
+    let mut command = Box::pin(session.send("Page.enable", json!({})));
+    assert!(futures::poll!(&mut command).is_pending());
+    let _ = ids(&mut queued).await;
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    assert!(matches!(command.await, Err(ConnectionError::Timeout { ms: 500, .. })));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_page_without_an_owner_and_a_closed_owner_keep_the_hang_guard() {
+    for owned in [false, true] {
+      let (connection, mut queued) = connection();
+      if owned {
+        connection.register_owner_timeout("page", owned_by(90_000));
+        connection.close_route(Some("page"), None);
+      }
+      let session = connection.page_proxy_session("page");
+      let mut command = Box::pin(session.send("Page.enable", json!({})));
+      assert!(futures::poll!(&mut command).is_pending());
+      assert!(queued.recv().await.is_some());
+      tokio::time::advance(std::time::Duration::from_millis(REPLY_TIMEOUT_MS)).await;
+      assert!(matches!(
+        command.await,
+        Err(ConnectionError::Timeout {
+          ms: REPLY_TIMEOUT_MS,
+          ..
+        })
+      ));
+    }
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_popup_inherits_the_timeout_of_the_page_that_opened_it() {
+    let (connection, mut queued) = connection();
+    connection.register_owner_timeout("opener", owned_by(700));
+    connection.inherit_owner_timeout("opener", "popup");
+    let session = connection.page_proxy_session("popup");
+    let mut command = Box::pin(session.send("Page.enable", json!({})));
+    assert!(futures::poll!(&mut command).is_pending());
+    assert!(queued.recv().await.is_some());
+    tokio::time::advance(std::time::Duration::from_millis(700)).await;
+    assert!(matches!(command.await, Err(ConnectionError::Timeout { ms: 700, .. })));
   }
 
   async fn ids(queued: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> (i64, i64) {

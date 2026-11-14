@@ -85,6 +85,19 @@ impl PageBackref {
     Self::default()
   }
 
+  pub(crate) fn budget(&self, default_ms: u64) -> crate::error::Result<crate::operation_budget::OperationBudget> {
+    match (crate::operation_budget::OperationBudget::capture(), self.upgrade()) {
+      (Some(budget), _) => Ok(budget),
+      (None, Some(page)) => crate::operation_budget::OperationBudget::new(page.default_timeout()),
+      (None, None) => crate::operation_budget::OperationBudget::current(default_ms),
+    }
+  }
+
+  pub(crate) fn default_timeout_source(&self) -> crate::operation_budget::TimeoutSource {
+    let slot = self.clone();
+    std::sync::Arc::new(move || slot.upgrade().map(|page| page.default_timeout()))
+  }
+
   pub fn set(&self, weak: std::sync::Weak<crate::page::Page>) {
     if let Ok(mut guard) = self.inner.lock() {
       guard.retain(|existing| existing.strong_count() > 0 && !existing.ptr_eq(&weak));
@@ -1154,6 +1167,12 @@ impl AnyPage {
       AnyPage::WebDriver(p) => &p.page_backref,
     };
     slot.set(weak);
+    match self {
+      AnyPage::CdpPipe(p) => p.own_command_timeouts(),
+      AnyPage::CdpWs(p) => p.own_command_timeouts(),
+      AnyPage::WebKit(p) => p.own_command_timeouts(),
+      AnyPage::Bidi(_) | AnyPage::WebDriver(_) => {},
+    }
   }
 
   /// Upgrade the page back-reference to the public wrapper `Arc<Page>`,
@@ -1414,8 +1433,8 @@ impl AnyPage {
     page_dispatch!(self, goto(url, lifecycle, timeout_ms, referer))
   }
 
-  pub async fn wait_for_navigation(&self) -> Result<()> {
-    page_dispatch!(self, wait_for_navigation())
+  pub async fn wait_for_navigation(&self, timeout_ms: u64) -> Result<()> {
+    page_dispatch!(self, wait_for_navigation(timeout_ms))
   }
 
   /// Snapshot navigation state before an input action (cheap, no RTT).
