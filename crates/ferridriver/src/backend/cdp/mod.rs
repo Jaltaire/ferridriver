@@ -335,9 +335,35 @@ const fn window_insets(headful: bool) -> (i64, i64) {
 }
 
 /// How long a tab brought to the front has to answer a capture before
-/// it is brought to the front again, and how many times that is tried.
+/// it is brought to the front again, and how long that is tried when
+/// no screenshot's budget says.
 const FRONT_TAB_DRAWN: Duration = Duration::from_millis(750);
-const FRONT_TAB_ATTEMPTS: usize = 12;
+const FRONT_TAB_PATIENCE_MS: u64 = 9_000;
+
+async fn auto_attached_session(
+  events: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<serde_json::Value>>,
+  target_id: &str,
+) -> Result<Option<String>> {
+  crate::operation_budget::OperationBudget::current(30_000)?
+    .wait(async {
+      while let Some(event) = events.recv().await {
+        if let Some(params) = event.get("params")
+          && params
+            .get("targetInfo")
+            .and_then(|info| info.get("targetId"))
+            .and_then(|v| v.as_str())
+            == Some(target_id)
+        {
+          return Ok(params.get("sessionId").and_then(|v| v.as_str()).map(String::from));
+        }
+      }
+      Err(FerriError::target_closed(Some(
+        "CDP event channel closed while waiting for Target.attachedToTarget".into(),
+      )))
+    })
+    .await
+    .map_err(|expired| expired.error(format!("auto-attach of target {target_id}")))?
+}
 
 /// Shared targetId -> sessionId cache. See [`CdpBrowser::attached_targets`].
 type AttachedTargets = Arc<std::sync::Mutex<FxHashMap<String, Option<String>>>>;
@@ -787,6 +813,9 @@ impl<T: CdpWrap> CdpBrowser<T> {
         browser_context: browser_context_id,
         opener: opener_id,
       } = parked;
+      if let Some(opener) = opener_id.as_deref() {
+        transport.inherit_owner_timeout(opener, &session_id);
+      }
       let claimed_page = Self::claim_popup(
         &transport,
         &downloads_dir,
@@ -1148,28 +1177,7 @@ impl<T: CdpWrap> CdpBrowser<T> {
 
     // Wait for Target.attachedToTarget event (from setAutoAttach in init).
     // The target is paused (waitForDebuggerOnStart) so we can set up everything.
-    let tid = target_id.clone();
-    let sid = tokio::time::timeout(Duration::from_secs(30), async move {
-      while let Some(event) = event_rx.recv().await {
-        if event.get("method").and_then(|m| m.as_str()) == Some("Target.attachedToTarget")
-          && let Some(params) = event.get("params")
-        {
-          let event_tid = params
-            .get("targetInfo")
-            .and_then(|i| i.get("targetId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-          if event_tid == tid {
-            return Ok(params.get("sessionId").and_then(|v| v.as_str()).map(String::from));
-          }
-        }
-      }
-      Err(FerriError::target_closed(Some(
-        "CDP event channel closed while waiting for Target.attachedToTarget".into(),
-      )))
-    })
-    .await
-    .map_err(|_| FerriError::timeout(format!("auto-attach of target {target_id}"), 30_000))??;
+    let sid = auto_attached_session(&mut event_rx, &target_id).await?;
     Ok((target_id, sid))
   }
 
@@ -1293,7 +1301,14 @@ impl<T: CdpWrap> CdpBrowser<T> {
     let _ = page.main_frame_id.set(page.target_id.to_string());
 
     if url != "about:blank" && !url.is_empty() {
-      page.goto(url, crate::backend::NavLifecycle::Load, 30_000, None).await?;
+      page
+        .goto(
+          url,
+          crate::backend::NavLifecycle::Load,
+          crate::operation_budget::enclosing_or(crate::page::DEFAULT_TIMEOUT_MS),
+          None,
+        )
+        .await?;
     }
 
     Ok(T::wrap_page(page))
@@ -1598,25 +1613,7 @@ impl CdpBrowser<ws::WsTransport> {
       // second session attached by hand can run commands, but resuming
       // there leaves the page frozen, never painting and never answering
       // a navigation.
-      let tid = target_id.clone();
-      let sid = tokio::time::timeout(Duration::from_secs(30), async move {
-        while let Some(event) = attach_events.recv().await {
-          if let Some(params) = event.get("params")
-            && params
-              .get("targetInfo")
-              .and_then(|info| info.get("targetId"))
-              .and_then(|v| v.as_str())
-              == Some(tid.as_str())
-          {
-            return Ok(params.get("sessionId").and_then(|v| v.as_str()).map(String::from));
-          }
-        }
-        Err(FerriError::target_closed(Some(
-          "CDP event channel closed while waiting for Target.attachedToTarget".into(),
-        )))
-      })
-      .await
-      .map_err(|_| FerriError::timeout(format!("auto-attach of target {target_id}"), 30_000))??;
+      let sid = auto_attached_session(&mut attach_events, &target_id).await?;
       Box::pin(Self::enable_domains(&transport, sid.as_deref(), None, false, None)).await?;
       let _ = transport
         .send_command(sid.as_deref(), "Runtime.runIfWaitingForDebugger", &super::EMPTY_PARAMS)
@@ -2551,6 +2548,16 @@ impl<T: CdpTransport> Clone for CdpPage<T> {
 }
 
 impl<T: CdpWrap> CdpPage<T> {
+  pub(crate) fn own_command_timeouts(&self) {
+    let source = self.page_backref.default_timeout_source();
+    self
+      .transport
+      .register_owner_timeout(&self.target_id, Arc::clone(&source));
+    if let Some(session_id) = self.session_id.as_deref() {
+      self.transport.register_owner_timeout(session_id, source);
+    }
+  }
+
   async fn initialize_adopted_frame(&self) -> Result<()> {
     self.transport.register_lifecycle_tracker(
       self.session_id.as_deref().unwrap_or(""),
@@ -2760,19 +2767,12 @@ impl<T: CdpWrap> CdpPage<T> {
     timeout_ms: u64,
     referer: Option<&str>,
   ) -> Result<Option<Response>> {
-    if timeout_ms == 0 {
-      // Playwright parity: 0 means no timeout.
-      return self.goto_inner(url, lifecycle, timeout_ms, referer).await;
-    }
-    match tokio::time::timeout_at(
-      crate::backend::deadline_for(timeout_ms),
+    crate::operation_budget::scoped_boxed(
+      timeout_ms,
+      || format!("navigating to {url}"),
       self.goto_inner(url, lifecycle, timeout_ms, referer),
     )
     .await
-    {
-      Ok(result) => result,
-      Err(_) => Err(FerriError::timeout(format!("navigating to {url}"), timeout_ms)),
-    }
   }
 
   async fn goto_inner(
@@ -2857,7 +2857,7 @@ impl<T: CdpWrap> CdpPage<T> {
     self
       .await_loader_lifecycle(&nav_loader_id, target_event, timeout_ms)
       .await?;
-    Ok(self.await_nav_response(Some(&nav_loader_id)).await)
+    Ok(self.await_nav_response(Some(&nav_loader_id), crate::network::document_response_wait()).await)
   }
 
   /// Resolve the main-document `Response` captured by the network
@@ -2870,13 +2870,13 @@ impl<T: CdpWrap> CdpPage<T> {
   /// the lifecycle reach us on separate consumers and the request can be
   /// processed second. A same-document navigation never issues one, so
   /// waiting there would only slow it down.
-  async fn await_nav_response(&self, loader_id: Option<&str>) -> Option<Response> {
+  async fn await_nav_response(&self, loader_id: Option<&str>, grace: std::time::Duration) -> Option<Response> {
     let Some(loader_id) = loader_id else {
       return self.nav_request_slot.final_response(std::time::Duration::ZERO).await;
     };
     self
       .nav_request_slot
-      .final_response_for(Some(loader_id), crate::network::NAV_REQUEST_GRACE)
+      .final_response_for(Some(loader_id), grace)
       .await
   }
 
@@ -2889,12 +2889,12 @@ impl<T: CdpWrap> CdpPage<T> {
       .clone()
   }
 
-  pub async fn wait_for_navigation(&self) -> Result<()> {
+  pub async fn wait_for_navigation(&self, timeout_ms: u64) -> Result<()> {
     let pre_loader_id = {
       let state = self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
       state.current_loader_id.clone()
     };
-    self.await_loader_change(&pre_loader_id, "load", 30_000).await
+    self.await_loader_change(&pre_loader_id, "load", timeout_ms).await
   }
 
   /// Snapshot the navigation state before an input action (cheap, no RTT):
@@ -2964,7 +2964,8 @@ impl<T: CdpWrap> CdpPage<T> {
       "format": "png",
       "clip": { "x": 0, "y": 0, "width": 1, "height": 1, "scale": 1 },
     });
-    for _ in 0..FRONT_TAB_ATTEMPTS {
+    let budget = self.page_backref.budget(FRONT_TAB_PATIENCE_MS)?;
+    while budget.remaining_ms().is_ok() {
       self.bring_to_front().await?;
       let drawn = self.cmd("Page.captureScreenshot", pixel.clone());
       if let Ok(answer) = tokio::time::timeout(FRONT_TAB_DRAWN, drawn).await {
@@ -2995,7 +2996,10 @@ impl<T: CdpWrap> CdpPage<T> {
     let loader_id = self.current_loader_id();
     Ok(
       self
-        .await_nav_response((loader_id != pre_loader_id).then_some(loader_id.as_str()))
+        .await_nav_response(
+          (loader_id != pre_loader_id).then_some(loader_id.as_str()),
+          crate::network::document_response_wait(),
+        )
         .await,
     )
   }
@@ -3056,7 +3060,10 @@ impl<T: CdpWrap> CdpPage<T> {
     let loader_id = self.current_loader_id();
     Ok(
       self
-        .await_nav_response((loader_id != pre_loader_id).then_some(loader_id.as_str()))
+        .await_nav_response(
+          (loader_id != pre_loader_id).then_some(loader_id.as_str()),
+          crate::network::NAV_REQUEST_GRACE,
+        )
         .await,
     )
   }
@@ -3349,7 +3356,7 @@ impl<T: CdpWrap> CdpPage<T> {
   }
 
   async fn resolve_frame_context(&self, frame_id: &str) -> Result<i64> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let budget = self.page_backref.budget(2_000)?;
     loop {
       // Register the waiter BEFORE checking the map (pin + enable, same
       // idiom as `settle_navigation`) so an insert landing between the
@@ -3366,7 +3373,7 @@ impl<T: CdpWrap> CdpPage<T> {
       {
         return Ok(id);
       }
-      if tokio::time::timeout_at(deadline, notified).await.is_err() {
+      if budget.wait(notified).await.is_err() {
         return Err(FerriError::Backend(format!(
           "No execution context found for frame '{frame_id}'. Frame may not be loaded yet."
         )));
@@ -4785,8 +4792,8 @@ impl<T: CdpWrap> CdpPage<T> {
   /// Evaluate `js` in the main frame's default context and every tracked
   /// child-frame context concurrently, returning each successful
   /// evaluation's boolean result. Per-frame failures (mid-navigation,
-  /// destroyed context) are skipped, and the whole batch is capped at
-  /// one second so a wedged frame cannot stall the input pipeline —
+  /// destroyed context) are skipped, and each evaluation is bounded by
+  /// the action's budget, or the page's default timeout outside one —
   /// the moral equivalent of Playwright's
   /// `safeNonStallingEvaluateInAllFrames`.
   async fn eval_bool_in_all_contexts(&self, js: &str, await_promise: bool) -> Vec<bool> {
@@ -4807,20 +4814,44 @@ impl<T: CdpWrap> CdpPage<T> {
       params.push(p);
     }
     let evals = params.into_iter().map(|p| self.cmd("Runtime.evaluate", p));
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(1), futures::future::join_all(evals));
-    match joined.await {
-      Ok(results) => results
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .map(|r| {
-          r.get("result")
-            .and_then(|res| res.get("value"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        })
-        .collect(),
-      Err(_) => Vec::new(),
+    futures::future::join_all(evals)
+      .await
+      .into_iter()
+      .filter_map(std::result::Result::ok)
+      .map(|r| {
+        r.get("result")
+          .and_then(|res| res.get("value"))
+          .and_then(serde_json::Value::as_bool)
+          .unwrap_or(false)
+      })
+      .collect()
+  }
+
+  fn take_intercepted_drag(&self) -> Option<serde_json::Value> {
+    match self.drag_manager.intercepted_slot.lock() {
+      Ok(mut slot) => slot.take(),
+      Err(poisoned) => poisoned.into_inner().take(),
     }
+  }
+
+  async fn intercepted_drag(&self) -> Result<Option<serde_json::Value>> {
+    let intercepted = self
+      .page_backref
+      .budget(2_000)?
+      .wait(async {
+        loop {
+          let notified = self.drag_manager.intercepted_notify.notified();
+          if let Some(data) = self.take_intercepted_drag() {
+            return data;
+          }
+          notified.await;
+        }
+      })
+      .await;
+    Ok(match intercepted {
+      Ok(data) => Some(data),
+      Err(_) => self.take_intercepted_drag(),
+    })
   }
 
   /// Port of `crDragDrop.ts::DragManager.interceptDragCausedByMove` for
@@ -4873,32 +4904,11 @@ impl<T: CdpWrap> CdpPage<T> {
       .await;
     move_result?;
 
-    let take_slot = || match self.drag_manager.intercepted_slot.lock() {
-      Ok(mut slot) => slot.take(),
-      Err(poisoned) => poisoned.into_inner().take(),
-    };
-    let mut drag_data = take_slot();
+    let mut drag_data = self.take_intercepted_drag();
     if expecting && drag_data.is_none() {
       // An un-prevented dragstart means Chromium WILL emit
-      // `Input.dragIntercepted`; the cap only guards a crashed renderer.
-      let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-      loop {
-        drag_data = take_slot();
-        if drag_data.is_some() {
-          break;
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-          break;
-        }
-        if tokio::time::timeout(deadline - now, self.drag_manager.intercepted_notify.notified())
-          .await
-          .is_err()
-        {
-          drag_data = take_slot();
-          break;
-        }
-      }
+      // `Input.dragIntercepted`; the budget only guards a crashed renderer.
+      drag_data = self.intercepted_drag().await?;
     }
     if let Some(data) = drag_data {
       self
@@ -5818,9 +5828,12 @@ impl<T: CdpWrap> CdpPage<T> {
 
     self.cmd("Tracing.end", super::empty_params()).await?;
 
-    let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+    let event = self
+      .page_backref
+      .budget(30_000)?
+      .wait(rx.recv())
       .await
-      .map_err(|_| FerriError::timeout("Tracing.tracingComplete", 30_000))?
+      .map_err(|expired| expired.error("Tracing.tracingComplete"))?
       .ok_or_else(|| FerriError::backend("CDP event stream closed before Tracing.tracingComplete"))?;
     let stream = event
       .pointer("/params/stream")
@@ -6224,6 +6237,7 @@ impl<T: CdpWrap> CdpPage<T> {
     // order after its request: that is what lets a navigation waiter
     // tell "no request" from "request not processed yet".
     let mut rx = transport.tap_event_domains(&["Network", "Page"], session_id.as_deref());
+    nav_request_slot.feed();
     let commits = nav_request_slot.clone();
     let main_frame = Arc::clone(&target_id);
     let tracker: Arc<NetworkTracker<T>> = Arc::new(NetworkTracker::new(

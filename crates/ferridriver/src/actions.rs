@@ -448,12 +448,15 @@ pub async fn fill(element: &AnyElement, page: &AnyPage, value: &str, force: bool
 // ─── Navigation ─────────────────────────────────────────────────────────────
 
 /// Navigate to URL with empty DOM health check for HTTP/HTTPS pages.
+/// `timeout_ms` bounds the navigation and the reload; 0 waits without a limit.
 ///
 /// # Errors
 ///
 /// Returns an error if navigation fails or the page DOM remains empty after retries.
-pub async fn navigate_with_health_check(page: &AnyPage, url: &str) -> Result<()> {
-  page.goto(url, crate::backend::NavLifecycle::Load, 30_000, None).await?;
+pub async fn navigate_with_health_check(page: &AnyPage, url: &str, timeout_ms: u64) -> Result<()> {
+  page
+    .goto(url, crate::backend::NavLifecycle::Load, timeout_ms, None)
+    .await?;
 
   let url_lower = url.to_lowercase();
   if url_lower.starts_with("http://") || url_lower.starts_with("https://") {
@@ -471,7 +474,7 @@ pub async fn navigate_with_health_check(page: &AnyPage, url: &str) -> Result<()>
     if is_empty().await {
       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
       if is_empty().await {
-        let _ = page.reload(crate::backend::NavLifecycle::Load, 30_000).await;
+        let _ = page.reload(crate::backend::NavLifecycle::Load, timeout_ms).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         if is_empty().await {
           return Err(
@@ -1402,13 +1405,13 @@ async fn pause_for_change(page: &AnyPage, pause: std::time::Duration) {
 ///
 /// Returns an error if the element is not actionable within the timeout.
 pub async fn wait_for_actionable(element: &AnyElement, page: &AnyPage) -> Result<()> {
-  let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+  let budget = crate::operation_budget::OperationBudget::current(5_000)?;
   let _ = page.ensure_engine_injected().await;
   let fd = "window.__fd";
 
   loop {
-    if tokio::time::Instant::now() >= deadline {
-      return Err(FerriError::timeout("element not actionable", 5_000));
+    if let Err(expired) = budget.remaining_ms() {
+      return Err(expired.error("element not actionable"));
     }
 
     let val = element
@@ -1438,14 +1441,14 @@ pub async fn wait_for_actionable(element: &AnyElement, page: &AnyPage) -> Result
 /// `["visible", "stable"]` for hover). Delegates to the page-side
 /// `awaitStates` helper, which runs the vendored `checkElementStates` —
 /// including the async rAF `stable` (bounding-box-steady) sampling — in a
-/// single round-trip per poll. Retries until the states pass or the 5s
-/// actionability deadline elapses.
+/// single round-trip per poll. Retries until the states pass or the
+/// action's budget (5s outside an action) elapses.
 ///
 /// # Errors
 ///
 /// Returns a timeout error if the states are not all satisfied in time.
 pub async fn wait_for_states(element: &AnyElement, page: &AnyPage, states: &[&str]) -> Result<()> {
-  let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+  let budget = crate::operation_budget::OperationBudget::current(5_000)?;
   let _ = page.ensure_engine_injected().await;
   let stable = stable_check().state();
   let states_lit = states
@@ -1460,8 +1463,8 @@ pub async fn wait_for_states(element: &AnyElement, page: &AnyPage, states: &[&st
   );
 
   loop {
-    if tokio::time::Instant::now() >= deadline {
-      return Err(FerriError::timeout("element not actionable", 5_000));
+    if let Err(expired) = budget.remaining_ms() {
+      return Err(expired.error("element not actionable"));
     }
 
     let val = element

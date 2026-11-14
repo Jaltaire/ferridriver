@@ -7,6 +7,7 @@ use crate::{FerriError, Result};
 
 tokio::task_local! {
   static CURRENT: Option<OperationBudget>;
+  static FALLBACKS: std::sync::Arc<std::sync::atomic::AtomicU64>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,7 +70,12 @@ impl OperationBudget {
   }
 
   pub(crate) fn current(default_ms: u64) -> Result<Self> {
-    Self::capture().map_or_else(|| Self::new(default_ms), Ok)
+    if let Some(budget) = Self::capture() {
+      Ok(budget)
+    } else {
+      let _ = FALLBACKS.try_with(|count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+      Self::new(default_ms)
+    }
   }
 
   pub(crate) fn scope<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
@@ -163,9 +169,226 @@ pub(crate) async fn scoped<T>(
   }
 }
 
+pub(crate) fn scoped_boxed<'a, T: Send + 'a>(
+  timeout_ms: u64,
+  operation: impl FnOnce() -> String + Send + 'a,
+  future: impl Future<Output = Result<T>> + Send + 'a,
+) -> futures::future::BoxFuture<'a, Result<T>> {
+  futures::FutureExt::boxed(scoped(timeout_ms, operation, future))
+}
+
+pub(crate) type TimeoutSource = std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct OwnerTimeouts {
+  sources: std::sync::RwLock<rustc_hash::FxHashMap<std::sync::Arc<str>, TimeoutSource>>,
+}
+
+impl OwnerTimeouts {
+  pub(crate) fn register(&self, owner: std::sync::Arc<str>, source: TimeoutSource) {
+    let existing: Vec<(std::sync::Arc<str>, TimeoutSource)> = self
+      .sources
+      .read()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .iter()
+      .map(|(owner, source)| (std::sync::Arc::clone(owner), std::sync::Arc::clone(source)))
+      .collect();
+    let gone: Vec<std::sync::Arc<str>> = existing
+      .into_iter()
+      .filter(|(_, source)| source().is_none())
+      .map(|(owner, _)| owner)
+      .collect();
+    let mut sources = self.sources.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for owner in &gone {
+      sources.remove(owner);
+    }
+    sources.insert(owner, source);
+  }
+
+  pub(crate) fn inherit(&self, from: &str, to: &str) {
+    let mut sources = self.sources.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(source) = sources.get(from).cloned() {
+      sources.insert(std::sync::Arc::from(to), source);
+    }
+  }
+
+  pub(crate) fn forget(&self, owner: &str) {
+    self
+      .sources
+      .write()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .remove(owner);
+  }
+
+  fn owned_ms(&self, owner: &str) -> Option<u64> {
+    let source = self
+      .sources
+      .read()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .get(owner)
+      .cloned()?;
+    source()
+  }
+
+  pub(crate) fn budget(&self, owner: Option<&str>, default_ms: u64) -> Result<OperationBudget> {
+    if let Some(budget) = OperationBudget::capture() {
+      return Ok(budget);
+    }
+    match owner.and_then(|owner| self.owned_ms(owner)) {
+      Some(timeout_ms) => OperationBudget::new(timeout_ms),
+      None => OperationBudget::current(default_ms),
+    }
+  }
+}
+
+pub(crate) fn enclosing_or(default_ms: u64) -> u64 {
+  OperationBudget::capture().map_or(default_ms, |_| 0)
+}
+
+pub(crate) fn within_boxed<'a, T: Send + 'a>(
+  timeout_ms: u64,
+  future: impl Future<Output = Result<T>> + Send + 'a,
+) -> futures::future::BoxFuture<'a, Result<T>> {
+  futures::FutureExt::boxed(async move { OperationBudget::operation(timeout_ms)?.scope(future).await })
+}
+
+#[doc(hidden)]
+pub async fn fallbacks_during<F: Future>(future: F) -> (F::Output, u64) {
+  let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+  let output = FALLBACKS.scope(std::sync::Arc::clone(&count), future).await;
+  (output, count.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn answering(timeout_ms: Option<u64>) -> TimeoutSource {
+    std::sync::Arc::new(move || timeout_ms)
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn an_owner_bounds_its_commands_by_its_own_timeout_and_a_scope_still_wins() {
+    let owners = OwnerTimeouts::default();
+    owners.register(std::sync::Arc::from("page"), answering(Some(60_000)));
+    let (budget, fallbacks) = fallbacks_during(async { owners.budget(Some("page"), 30_000).unwrap() }).await;
+    assert_eq!((budget.timeout_ms(), fallbacks), (60_000, 0));
+    let (budget, fallbacks) = fallbacks_during(async { owners.budget(Some("stranger"), 30_000).unwrap() }).await;
+    assert_eq!((budget.timeout_ms(), fallbacks), (30_000, 1));
+    let (budget, fallbacks) = fallbacks_during(async { owners.budget(None, 30_000).unwrap() }).await;
+    assert_eq!((budget.timeout_ms(), fallbacks), (30_000, 1));
+    let scoped = OperationBudget::new(500)
+      .unwrap()
+      .scope(async { owners.budget(Some("page"), 30_000).unwrap() })
+      .await;
+    assert_eq!(scoped.timeout_ms(), 500);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn an_owner_whose_page_is_gone_falls_back_and_is_swept_by_the_next_registration() {
+    let owners = OwnerTimeouts::default();
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let answer = std::sync::Arc::clone(&alive);
+    owners.register(
+      std::sync::Arc::from("closed"),
+      std::sync::Arc::new(move || answer.load(std::sync::atomic::Ordering::Relaxed).then_some(0_u64)),
+    );
+    assert_eq!(
+      owners.budget(Some("closed"), 30_000).unwrap().remaining_ms().unwrap(),
+      None
+    );
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (budget, fallbacks) = fallbacks_during(async { owners.budget(Some("closed"), 30_000).unwrap() }).await;
+    assert_eq!((budget.timeout_ms(), fallbacks), (30_000, 1));
+    owners.register(std::sync::Arc::from("open"), answering(Some(1_000)));
+    assert!(!owners.sources.read().unwrap().contains_key("closed"));
+    owners.forget("open");
+    assert!(owners.sources.read().unwrap().is_empty());
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_popup_inherits_its_openers_timeout_until_it_registers_its_own() {
+    let owners = OwnerTimeouts::default();
+    owners.inherit("opener", "orphan");
+    assert!(owners.sources.read().unwrap().is_empty());
+    owners.register(std::sync::Arc::from("opener"), answering(Some(45_000)));
+    owners.inherit("opener", "popup");
+    assert_eq!(owners.budget(Some("popup"), 30_000).unwrap().timeout_ms(), 45_000);
+    owners.register(std::sync::Arc::from("popup"), answering(Some(5_000)));
+    assert_eq!(owners.budget(Some("popup"), 30_000).unwrap().timeout_ms(), 5_000);
+    assert_eq!(owners.budget(Some("opener"), 30_000).unwrap().timeout_ms(), 45_000);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_command_of_an_owner_with_a_longer_timeout_outlasts_the_old_fixed_thirty_seconds() {
+    let owners = OwnerTimeouts::default();
+    owners.register(std::sync::Arc::from("page"), answering(Some(60_000)));
+    let budget = owners.budget(Some("page"), 30_000).unwrap();
+    let reply = budget
+      .wait(async {
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        "answered"
+      })
+      .await;
+    assert_eq!(reply.unwrap(), "answered");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn within_boxed_bounds_commands_but_runs_its_future_to_the_end() {
+    let started = Instant::now();
+    let finished = within_boxed(100, async {
+      assert_eq!(OperationBudget::capture().unwrap().timeout_ms(), 100);
+      tokio::time::sleep(Duration::from_millis(250)).await;
+      assert!(OperationBudget::capture().unwrap().remaining_ms().is_err());
+      Ok("cleaned up")
+    })
+    .await
+    .unwrap();
+    assert_eq!(finished, "cleaned up");
+    assert_eq!(Instant::now() - started, Duration::from_millis(250));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn scoped_boxed_names_the_operation_and_its_callers_timeout() {
+    let error = scoped_boxed(500, || "creating a page".into(), async {
+      tokio::time::sleep(Duration::from_secs(120)).await;
+      Ok(())
+    })
+    .await
+    .unwrap_err();
+    assert!(error.is_timeout_error());
+    assert!(error.to_string().contains("creating a page"), "{error}");
+    assert!(error.to_string().contains("500ms"), "{error}");
+    let inner_expiry = scoped_boxed(500, || "closing the page".into(), async {
+      Err::<(), _>(
+        OperationBudget::current(30_000)?
+          .wait(std::future::pending::<()>())
+          .await
+          .unwrap_err()
+          .error("waiting for Target.close reply"),
+      )
+    })
+    .await
+    .unwrap_err();
+    assert!(inner_expiry.to_string().contains("closing the page"), "{inner_expiry}");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_wait_inside_a_scope_follows_it_and_a_wait_outside_follows_its_old_default() {
+    assert_eq!(enclosing_or(30_000), 30_000);
+    let inside = OperationBudget::new(60_000)
+      .unwrap()
+      .scope(async {
+        (
+          enclosing_or(30_000),
+          OperationBudget::current(2_000).unwrap().timeout_ms(),
+        )
+      })
+      .await;
+    assert_eq!(inside, (0, 60_000));
+    let (outside, fallbacks) = fallbacks_during(async { OperationBudget::current(2_000).unwrap().timeout_ms() }).await;
+    assert_eq!((outside, fallbacks), (2_000, 1));
+  }
 
   #[tokio::test(start_paused = true)]
   async fn queue_capacity_preserves_order_and_releases_cancelled_reservations() {

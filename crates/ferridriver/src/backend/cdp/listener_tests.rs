@@ -87,6 +87,14 @@ impl CdpTransport for Wire {
   fn unregister_session(&self, session_id: &str) {
     self.dispatcher.unregister_session(session_id);
   }
+
+  fn register_owner_timeout(&self, session_id: &str, source: crate::operation_budget::TimeoutSource) {
+    self.dispatcher.register_owner_timeout(session_id, source);
+  }
+
+  fn inherit_owner_timeout(&self, from: &str, to: &str) {
+    self.dispatcher.inherit_owner_timeout(from, to);
+  }
 }
 
 // The listeners are functions of a page type that can be wrapped; none of

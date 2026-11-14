@@ -121,7 +121,9 @@ impl Frame {
   /// # Errors
   ///
   /// Returns a [`crate::error::FerriError`] on page-side exception or
-  /// protocol failure.
+  /// protocol failure, and [`crate::error::FerriError::Timeout`] once the
+  /// page's default timeout runs out. A default timeout of `0` waits as
+  /// long as the page takes, as Playwright's `evaluate` does.
   pub async fn evaluate(
     &self,
     fn_source: &str,
@@ -134,7 +136,11 @@ impl Frame {
         "Frame",
         "evaluate",
         serde_json::json!({ "expression": fn_source }),
-        self.evaluate_untraced(fn_source, arg, is_function),
+        futures::FutureExt::boxed(crate::operation_budget::scoped(
+          self.page.default_timeout(),
+          || "evaluate".into(),
+          self.evaluate_untraced(fn_source, arg, is_function),
+        )),
       )
       .await
   }

@@ -22,7 +22,7 @@ use tokio::sync::Mutex as AsyncMutex;
 const UNSET_TIMEOUT: u64 = u64::MAX;
 
 /// Playwright's floor when nothing in the chain sets a timeout.
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// High-level page API, mirrors Playwright's Page interface.
 /// Always constructed behind `Arc<Page>` — locators, frames, and consumers
@@ -617,7 +617,9 @@ impl Page {
     &self.inner
   }
 
-  /// Set the default timeout for all operations (milliseconds).
+  /// Set the default timeout for all operations (milliseconds), among
+  /// them `evaluate` and a screenshot given no timeout of its own.
+  /// Passing `0` means "no timeout".
   pub fn set_default_timeout(&self, ms: u64) {
     self.default_timeout.store(ms, Ordering::Relaxed);
   }
@@ -1293,13 +1295,17 @@ impl Page {
     arg: crate::protocol::SerializedArgument,
     is_function: Option<bool>,
   ) -> Result<crate::protocol::SerializedValue> {
-    self
-      .traced(
-        "evaluate",
-        serde_json::json!({ "expression": fn_source }),
-        self.main_frame().evaluate(fn_source, arg.clone(), is_function),
-      )
-      .await
+    let frame = self.main_frame();
+    futures::FutureExt::boxed(async move {
+      self
+        .traced(
+          "evaluate",
+          serde_json::json!({ "expression": fn_source }),
+          frame.evaluate(fn_source, arg, is_function),
+        )
+        .await
+    })
+    .await
   }
 
   /// Typed evaluate: run `fn_source` in the page and deserialize the
@@ -2246,13 +2252,14 @@ impl Page {
   /// `/tmp/playwright/packages/playwright-core/types/types.d.ts:23280`.
   ///
   /// The `screenshotter` module does the capture; this writes `path` and
-  /// bounds the whole of it by `timeout`.
+  /// bounds the whole of it by `timeout`, or by the page's default
+  /// timeout when the options give none. `0` means no timeout.
   ///
   /// # Errors
   ///
   /// Returns [`crate::error::FerriError::Timeout`] if the capture
-  /// exceeds `opts.timeout` milliseconds; otherwise propagates any
-  /// backend-specific failure.
+  /// exceeds that timeout; otherwise propagates any backend-specific
+  /// failure.
   #[track_caller]
   pub fn screenshot(&self) -> crate::action::Action<'_, ScreenshotOptions, Vec<u8>> {
     let page = self;
@@ -2797,7 +2804,12 @@ impl Page {
   ///
   /// [`crate::error::FerriError::Unsupported`] on the `BiDi` and `WebKit` backends.
   pub async fn stop_tracing(&self) -> Result<Vec<serde_json::Value>> {
-    self.inner.stop_tracing().await
+    crate::operation_budget::scoped_boxed(
+      self.default_timeout(),
+      || "stopping tracing".into(),
+      self.inner.stop_tracing(),
+    )
+    .await
   }
 
   /// Get performance metrics from the page.
@@ -2962,7 +2974,12 @@ impl Page {
       Err(error) if error.is_unsupported() => {
         return self
           .inner
-          .goto(origin, crate::backend::NavLifecycle::Load, 10_000, None)
+          .goto(
+            origin,
+            crate::backend::NavLifecycle::Load,
+            self.default_navigation_timeout(),
+            None,
+          )
           .await
           .map(|_| ());
       },
@@ -2970,7 +2987,12 @@ impl Page {
     }
     let navigation = self
       .inner
-      .goto(origin, crate::backend::NavLifecycle::Load, 10_000, None)
+      .goto(
+        origin,
+        crate::backend::NavLifecycle::Load,
+        self.default_navigation_timeout(),
+        None,
+      )
       .await;
     let cleanup = self
       .inner
@@ -4694,7 +4716,7 @@ impl Page {
         *guard = Some(reason);
       }
     }
-    self.inner.close_page(opts).await?;
+    crate::operation_budget::within_boxed(self.default_timeout(), self.inner.close_page(opts)).await?;
     // Playwright emits 'close' on the page once it is closed.
     self.inner.events().emit(PageEvent::Close);
 

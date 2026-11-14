@@ -459,7 +459,22 @@ impl ContextRef {
     // including ones on a different instance.
     Box::pin(BrowserState::ensure_instance_shared(&self.state, &self.key.instance)).await?;
     ensure_popup_pump(&self.state, &self.key.instance).await;
+    crate::operation_budget::scoped_boxed(
+      self.effective_default_timeout(),
+      || "creating a page".into(),
+      self.open_page(),
+    )
+    .await
+  }
 
+  pub(crate) fn effective_default_timeout(&self) -> u64 {
+    match self.default_timeout() {
+      0 => crate::page::DEFAULT_TIMEOUT_MS,
+      ms => ms,
+    }
+  }
+
+  async fn open_page(&self) -> Result<Arc<Page>> {
     // Read the (optional) `BrowserContextOptions` bag before the open —
     // a custom `viewport` (or `null` viewport) has to be known up-front
     // so the backend opens the page at the right size rather than
@@ -857,7 +872,12 @@ impl ContextRef {
       let composite = self.composite();
       let span = crate::trace::begin_action(Some(&composite), "BrowserContext", method, None, params);
       let span = crate::trace::open_action(span).await;
-      let result = crate::trace::within_action(crate::abort::guard(op)).await;
+      let bounded = async {
+        crate::operation_budget::OperationBudget::operation(self.effective_default_timeout())?
+          .scope(op)
+          .await
+      };
+      let result = crate::trace::within_action(crate::abort::guard(bounded)).await;
       if let Some(span) = span {
         span.finish(result.as_ref().err());
       }
@@ -942,7 +962,12 @@ impl ContextRef {
     &self,
   ) -> crate::action::Action<'static, crate::options::StorageStateOptions, crate::options::StorageState> {
     let this = self.clone();
-    crate::action::Action::new(move |opts| Box::pin(async move { this.storage_state_impl(Some(opts)).await }))
+    crate::action::Action::new(move |opts| {
+      Box::pin(async move {
+        crate::operation_budget::within_boxed(this.effective_default_timeout(), this.storage_state_impl(Some(opts)))
+          .await
+      })
+    })
   }
 
   pub(crate) async fn storage_state_impl(
@@ -1457,6 +1482,14 @@ impl ContextRef {
     // Flush `routeFromHAR(update: true)` recorders while the network log
     // is still reachable — Playwright writes the updated HAR on context
     // close (`browserContext.ts` exports every live HAR recorder).
+    crate::operation_budget::within_boxed(self.effective_default_timeout(), self.dispose(opts)).await?;
+    if first_close {
+      self.events.emit(crate::events::ContextEvent::Close(self.clone()));
+    }
+    Ok(())
+  }
+
+  async fn dispose(&self, opts: Option<crate::options::ContextCloseOptions>) -> Result<()> {
     self.flush_har_updates().await?;
     let mut state = self.state.write().await;
     if let Some(reason) = opts.and_then(|o| o.reason) {
@@ -1472,10 +1505,6 @@ impl ContextRef {
       // the underlying browser too. Playwright:
       // `/tmp/playwright/packages/playwright-core/types/types.d.ts:15199`.
       state.shutdown().await?;
-    }
-    drop(state);
-    if first_close {
-      self.events.emit(crate::events::ContextEvent::Close(self.clone()));
     }
     Ok(())
   }

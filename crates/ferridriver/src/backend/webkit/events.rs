@@ -171,6 +171,7 @@ pub fn attach_listeners(
   let emitter = page.events.clone();
   let requests = page.requests.clone();
   let nav_slot = page.nav_request_slot.clone();
+  nav_slot.feed();
   let routes = page.routes.clone();
   let frame_contexts = page.frame_contexts.clone();
   let utility_contexts = page.utility_contexts.clone();

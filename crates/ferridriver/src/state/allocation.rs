@@ -243,7 +243,10 @@ impl Allocation {
     let browser = match &mode {
       ConnectMode::Launch => {
         let relay = spec.relay_launch_proxy(&mut effective).await?;
-        let browser = spec.launch_browser(&effective).await?;
+        let budget = self.handshake_budget(effective.launch_timeout)?;
+        let browser = futures::FutureExt::boxed(budget.scope(budget.wait(spec.launch_browser(&effective))))
+          .await
+          .map_err(|error| error.error("launching browser"))??;
         spec.record_launched_proxy(instance, effective.launched_proxy.as_ref(), relay);
         browser
       },
@@ -264,8 +267,7 @@ impl Allocation {
             } => Some(*timeout),
             _ => effective.launch_timeout,
           };
-          let requested = crate::operation_budget::OperationBudget::new(timeout.unwrap_or(30_000))?;
-          let budget = *self.connection_budget.get_or_init(|| requested);
+          let budget = self.handshake_budget(timeout)?;
           budget
             .scope(budget.wait(connect))
             .await
@@ -277,6 +279,11 @@ impl Allocation {
     };
     *self.browser.lock().await = Some(browser);
     Ok(mode)
+  }
+
+  fn handshake_budget(&self, timeout: Option<u64>) -> Result<crate::operation_budget::OperationBudget> {
+    let requested = crate::operation_budget::OperationBudget::new(timeout.unwrap_or(30_000))?;
+    Ok(*self.connection_budget.get_or_init(|| requested))
   }
 
   pub(super) async fn take_browser(&self) -> Result<AnyBrowser> {

@@ -157,22 +157,7 @@ impl WebKitBrowser {
       }),
     };
     if let Some(mut events) = startup_events {
-      let proxy_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(event) = events.recv().await {
-          if event.method.as_deref() == Some("Playwright.pageProxyCreated") {
-            return event
-              .params
-              .get("pageProxyId")
-              .and_then(serde_json::Value::as_str)
-              .map(String::from);
-          }
-        }
-        None
-      })
-      .await
-      .ok()
-      .flatten()
-      .ok_or_else(|| BrowserError::Protocol("persistent context did not open a startup page".into()))?;
+      let proxy_id = startup_page_proxy(&mut events).await?;
       let page = WebKitPage::attach(&browser, browser.inner.conn.page_proxy_session(proxy_id), None, false).await?;
       browser
         .inner
@@ -286,6 +271,9 @@ impl WebKitBrowser {
     context_id: Option<String>,
     opener: Option<String>,
   ) -> impl std::future::Future<Output = ()> + Send + 'static {
+    if let Some(opener) = opener.as_deref() {
+      self.inner.conn.inherit_owner_timeout(opener, &proxy_id);
+    }
     let proxy = self.inner.conn.page_proxy_session(proxy_id.clone());
     let attach = WebKitPage::attach(self, proxy, context_id.clone(), true);
     let pages = Arc::clone(&self.inner.pages);
@@ -543,7 +531,14 @@ impl WebKitBrowser {
       page.emulate_viewport(vp).await?;
     }
     if !url.is_empty() && url != "about:blank" {
-      page.goto(url, crate::backend::NavLifecycle::Load, 30_000, None).await?;
+      page
+        .goto(
+          url,
+          crate::backend::NavLifecycle::Load,
+          crate::operation_budget::enclosing_or(crate::page::DEFAULT_TIMEOUT_MS),
+          None,
+        )
+        .await?;
     }
     self
       .inner
@@ -811,6 +806,34 @@ fn handle_provisional_load_failed(params: &serde_json::Value, pages: &Arc<Mutex<
   }
 }
 
+async fn startup_page_proxy(
+  events: &mut tokio::sync::mpsc::UnboundedReceiver<super::protocol::Envelope>,
+) -> std::result::Result<String, BrowserError> {
+  let budget = crate::operation_budget::OperationBudget::current(10_000)
+    .map_err(|error| BrowserError::Protocol(error.to_string()))?;
+  budget
+    .wait(async {
+      while let Some(event) = events.recv().await {
+        if event.method.as_deref() == Some("Playwright.pageProxyCreated") {
+          return event
+            .params
+            .get("pageProxyId")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        }
+      }
+      None
+    })
+    .await
+    .map_err(|expired| {
+      BrowserError::Connection(super::connection::ConnectionError::Timeout {
+        method: "Playwright.pageProxyCreated".into(),
+        ms: expired.timeout_ms,
+      })
+    })?
+    .ok_or_else(|| BrowserError::Protocol("persistent context did not open a startup page".into()))
+}
+
 fn find_page(pages: &Arc<Mutex<Vec<WebKitPage>>>, page_proxy_id: &str) -> Option<WebKitPage> {
   pages
     .lock()
@@ -818,6 +841,51 @@ fn find_page(pages: &Arc<Mutex<Vec<WebKitPage>>>, page_proxy_id: &str) -> Option
     .iter()
     .find(|p| p.page_proxy_id() == page_proxy_id)
     .cloned()
+}
+
+#[cfg(test)]
+mod startup_tests {
+  use super::{BrowserError, startup_page_proxy};
+  use crate::backend::webkit::connection::ConnectionError;
+  use crate::operation_budget::OperationBudget;
+
+  fn announced(method: &str) -> crate::backend::webkit::protocol::Envelope {
+    serde_json::from_value(serde_json::json!({"method": method, "params": {"pageProxyId": "startup"}})).unwrap()
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_startup_page_announced_after_the_old_ten_seconds_opens_within_the_launch_timeout() {
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let announcing = tokio::spawn(async move {
+      sender.send(announced("Playwright.pageProxyDestroyed")).unwrap();
+      tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+      sender.send(announced("Playwright.pageProxyCreated")).unwrap();
+      sender
+    });
+    let proxy = OperationBudget::new(20_000)
+      .unwrap()
+      .scope(startup_page_proxy(&mut events))
+      .await
+      .unwrap();
+    assert_eq!(proxy, "startup");
+    let _sender = announcing.await.unwrap();
+    let expired = OperationBudget::new(20_000)
+      .unwrap()
+      .scope(startup_page_proxy(&mut events))
+      .await;
+    assert!(matches!(
+      expired,
+      Err(BrowserError::Connection(ConnectionError::Timeout { ms: 20_000, .. }))
+    ));
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_launch_with_no_startup_page_says_so() {
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    drop(sender);
+    let closed = startup_page_proxy(&mut events).await;
+    assert!(matches!(closed, Err(BrowserError::Protocol(message)) if message.contains("startup page")));
+  }
 }
 
 #[cfg(test)]
