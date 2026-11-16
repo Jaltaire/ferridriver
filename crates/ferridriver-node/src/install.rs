@@ -103,6 +103,50 @@ pub fn find_installed_firefox() -> Option<String> {
   BrowserInstaller::new().find_installed_firefox()
 }
 
+/// Where `installWebkitRevision` installs, and which hosts it downloads from.
+#[napi(object)]
+#[derive(Default)]
+pub struct InstallWebkitRevisionOptions {
+  /// The browser cache to install into. Defaults to Playwright's own:
+  /// `PLAYWRIGHT_BROWSERS_PATH` when it names a directory, otherwise
+  /// `ms-playwright` under the platform cache directory.
+  pub cache_dir: Option<String>,
+  /// Hosts to download from, tried in order, instead of Playwright's CDN
+  /// mirrors, as `PLAYWRIGHT_DOWNLOAD_HOST` does for Playwright. Each serves
+  /// `builds/webkit/<revision>/<archive>`.
+  pub download_hosts: Option<Vec<String>>,
+}
+
+/// Install WebKit build `revision` into Playwright's browser cache, as
+/// `playwright install webkit` lays it out, for a project pinned to the
+/// `playwright-core` whose `browsers.json` names that revision. A build
+/// already marked complete is kept. Returns the path to the build's
+/// `pw_run.sh`.
+#[napi]
+pub async fn install_webkit_revision(
+  revision: String,
+  options: Option<InstallWebkitRevisionOptions>,
+) -> Result<String> {
+  let options = options.unwrap_or_default();
+  let cache = match options.cache_dir {
+    Some(dir) => std::path::PathBuf::from(dir),
+    None => ferridriver::install::playwright_cache_dir().ok_or_else(|| {
+      Error::new(
+        Status::InvalidArg,
+        "PLAYWRIGHT_BROWSERS_PATH=0 keeps browsers inside an npm package, so name a cacheDir",
+      )
+    })?,
+  };
+  let installer = match options.download_hosts {
+    Some(hosts) => BrowserInstaller::new().with_download_hosts(hosts),
+    None => BrowserInstaller::new(),
+  };
+  installer
+    .install_webkit_revision(&revision, &cache, |_| {})
+    .await
+    .map_err(crate::error::to_napi)
+}
+
 /// Get the browser cache directory path.
 #[napi]
 pub fn get_browser_cache_dir() -> String {
