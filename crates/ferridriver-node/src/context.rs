@@ -140,6 +140,16 @@ impl BrowserContext {
     .build(env)
   }
 
+  /// A raw `WebKit` Inspector Protocol session on `page`'s main target,
+  /// the `WebKit` counterpart of `newCDPSession`. Playwright keeps the same
+  /// session private, as `WKPage._session`. `WebKit`-only; a page of
+  /// another context is refused.
+  #[napi(js_name = "newWebKitSession")]
+  pub fn new_webkit_session(&self, page: &crate::page::Page) -> Result<crate::webkit_session::WebKitSession> {
+    let session = self.inner.new_webkit_session(&page.inner_arc()).into_napi()?;
+    Ok(crate::webkit_session::WebKitSession::wrap(session))
+  }
+
   /// Create a new page in this context.
   #[napi(ts_return_type = "Promise<Page>")]
   pub async fn new_page(&self) -> Result<crate::identity::PageObject> {

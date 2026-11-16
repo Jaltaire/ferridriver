@@ -64,6 +64,7 @@ pub mod web_error;
 pub mod web_mcp;
 pub mod web_socket_route;
 pub mod web_storage;
+pub mod webkit_session;
 pub mod worker;
 
 pub use android::{AndroidDeviceJs, AndroidJs, install_android};

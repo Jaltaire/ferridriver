@@ -2138,6 +2138,28 @@ export interface CDPSession {
   detach(): Promise<void>;
 }
 
+/** One protocol event from a WebKit page's target. */
+export interface WebKitEvent {
+  method: string;
+  params: unknown;
+}
+
+/** The events of one WebKit target, in wire order. */
+export interface WebKitEvents {
+  /** The next event, or `null` once the target has gone away. */
+  next(): Promise<WebKitEvent | null>;
+}
+
+/** A raw WebKit Inspector Protocol session on a page's main target. */
+export interface WebKitSession {
+  /** Sends a command to the target that is live at the call. */
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  /** The id of the page's live target; it changes on a cross-process navigation. */
+  targetId(): string;
+  /** The live target's events from now on; they end when that target goes away. */
+  events(): WebKitEvents;
+}
+
 /** A dedicated web worker a page started. */
 export interface Worker {
   url(): string;
@@ -2541,6 +2563,7 @@ export interface BrowserContext {
   setDefaultTimeout(timeout: number): void;
   setDefaultNavigationTimeout(timeout: number): void;
   newCDPSession(page: Page): Promise<CDPSession>;
+  newWebKitSession(page: Page): WebKitSession;
   browser(): Browser | null;
   credentials: Credentials;
   clock: Clock;

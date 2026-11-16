@@ -83,6 +83,25 @@ impl BrowserContextJs {
     rquickjs::IntoJs::into_js(instance, &ctx)
   }
 
+  /// A raw `WebKit` Inspector Protocol session on `page`'s main target,
+  /// the `WebKit` counterpart of `newCDPSession`. Playwright keeps the same
+  /// session private, as `WKPage._session`. `WebKit`-only; a page of
+  /// another context is refused.
+  #[qjs(rename = "newWebKitSession")]
+  pub fn new_webkit_session<'js>(
+    &self,
+    ctx: Ctx<'js>,
+    page: rquickjs::Class<'js, crate::bindings::page::PageJs>,
+  ) -> rquickjs::Result<Value<'js>> {
+    let core_page = page.borrow().page_arc();
+    let session = self.inner.new_webkit_session(&core_page).into_js_with(&ctx)?;
+    let instance = rquickjs::class::Class::instance(
+      ctx.clone(),
+      crate::bindings::webkit_session::WebKitSessionJs::new(session),
+    )?;
+    rquickjs::IntoJs::into_js(instance, &ctx)
+  }
+
   // ── Cookies ───────────────────────────────────────────────────────────────
 
   /// All cookies visible in this context.
